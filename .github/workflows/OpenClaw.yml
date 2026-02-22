@@ -17,13 +17,23 @@ on:
         type: string
 
 jobs:
-  onboard:
+  onboard-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────
+      # 0. Mask sensitive inputs so they don't leak in logs
+      # ──────────────────────────────────────────────
+
+      - name: Mask secrets
+        run: |
+          echo "::add-mask::${{ github.event.inputs.encrypted_tokens }}"
+          echo "::add-mask::${{ github.event.inputs.decryption_password }}"
+          echo "::add-mask::${{ github.event.inputs.discord_bot_token }}"
 
       # ──────────────────────────────────────────────
       # 1. Setup runtimes
@@ -37,7 +47,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
+          cache: false
 
       - name: Install system dependencies
         run: |
@@ -53,7 +64,7 @@ jobs:
           set -euo pipefail
           echo "::group::Installing OpenClaw"
           npm install -g openclaw@latest
-          openclaw --version
+          echo "OpenClaw version: $(openclaw --version)"
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
@@ -115,8 +126,7 @@ jobs:
             exit 1
           fi
 
-          echo "Token files:"
-          ls -la "$AUTH_DIR"/qwen-*.json
+          echo "Token files found: $TOKEN_COUNT"
 
           # Cleanup temp files
           rm -rf "$TEMP_DIR"
@@ -129,23 +139,23 @@ jobs:
           set -euo pipefail
           echo "::group::Creating CLIProxyAPI config"
 
-          cat > "$AUTH_DIR/config.yaml" <<CFGEOF
+          cat > "$AUTH_DIR/config.yaml" <<EOF
           port: 8317
           host: "127.0.0.1"
           auth-dir: "$AUTH_DIR"
-          debug: false
-          logging-to-file: true
+          debug: true
+          logging-to-file: false
           api-keys:
             - "dummykey"
           routing:
             strategy: "round-robin"
           request-retry: 3
-          CFGEOF
+          EOF
 
           # Fix indentation (remove leading whitespace from heredoc)
           sed -i 's/^          //' "$AUTH_DIR/config.yaml"
 
-          echo "CLIProxyAPI config:"
+          echo "CLIProxyAPI config created"
           cat "$AUTH_DIR/config.yaml"
           echo "::endgroup::"
 
@@ -154,38 +164,51 @@ jobs:
           set -euo pipefail
           echo "::group::Starting CLIProxyAPI"
 
-          # Start CLIProxyAPI in background
+          # Start CLIProxyAPI in background with logs going to a file AND stdout
           nohup cliproxyapi -config "$AUTH_DIR/config.yaml" > /tmp/cliproxyapi.log 2>&1 &
           PROXY_PID=$!
           echo "CLIProxyAPI started (PID: $PROXY_PID)"
           echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
 
-          # Wait for the proxy to be ready
+          # Wait for the proxy to be ready (use auth header since api-keys are configured)
           echo "Waiting for CLIProxyAPI to be ready..."
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:8317/v1/models > /dev/null 2>&1; then
-              echo "CLIProxyAPI is ready!"
-              break
-            fi
+          READY=false
+          for i in $(seq 1 60); do
+            # Check if process is still alive
             if ! kill -0 $PROXY_PID 2>/dev/null; then
               echo "::error::CLIProxyAPI process died unexpectedly"
               cat /tmp/cliproxyapi.log || true
               exit 1
             fi
-            if [ "$i" -eq 30 ]; then
-              echo "::warning::CLIProxyAPI didn't respond to health check within 30 seconds"
-              echo "Logs:"
-              cat /tmp/cliproxyapi.log || true
-              # Continue anyway - the non-interactive onboard uses --custom-compatibility openai
-              # so it won't probe the endpoint
+
+            # Try health check with auth header
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer dummykey" \
+              http://127.0.0.1:8317/v1/models 2>/dev/null || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "CLIProxyAPI is ready! (HTTP $HTTP_CODE)"
+              READY=true
+              break
             fi
-            sleep 1
+
+            echo "  Attempt $i/60: HTTP $HTTP_CODE - waiting..."
+            sleep 2
           done
+
+          if [ "$READY" = "false" ]; then
+            echo "::warning::CLIProxyAPI didn't return 200 within 120 seconds"
+            echo "Last CLIProxyAPI logs:"
+            tail -30 /tmp/cliproxyapi.log || true
+            echo ""
+            echo "Continuing anyway (onboarding uses --custom-compatibility openai to skip probing)"
+          fi
 
           # Show available models
           echo ""
           echo "Available models:"
-          curl -s http://127.0.0.1:8317/v1/models 2>/dev/null | jq '.data[].id' 2>/dev/null || echo "(could not list models)"
+          curl -s -H "Authorization: Bearer dummykey" \
+            http://127.0.0.1:8317/v1/models 2>/dev/null | jq '.data[].id' 2>/dev/null || echo "(could not list models)"
 
           echo "::endgroup::"
 
@@ -205,7 +228,6 @@ jobs:
             --custom-api-key "dummykey" \
             --custom-model-id "qwen3-coder-plus" \
             --custom-compatibility openai \
-            --install-daemon \
             --skip-channels \
             --skip-skills \
             --skip-health \
@@ -233,13 +255,7 @@ jobs:
             exit 1
           fi
 
-          echo "Current config (before patching):"
-          jq '.' "$CONFIG_FILE"
-
           # Patch Discord configuration
-          # - enabled: true
-          # - token: from workflow input
-          # - groupPolicy: "open" (allow all channels)
           jq --arg token "$DISCORD_BOT_TOKEN" '
             .channels = (.channels // {}) |
             .channels.discord = {
@@ -250,47 +266,26 @@ jobs:
             }
           ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-          echo "Discord configuration patched"
+          echo "Discord configuration patched successfully"
           echo "::endgroup::"
 
-      - name: Patch OpenClaw config for Skills
+      - name: Patch OpenClaw config for Skills and Hooks
         run: |
           set -euo pipefail
-          echo "::group::Patching OpenClaw config for Skills"
+          echo "::group::Patching Skills and Hooks"
 
           CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-          # Patch skills configuration
-          # - nodeManager: npm
-          # - skip all API key prompts (none set)
+          # Patch skills + hooks in one go
           jq '
             .skills = (.skills // {}) |
-            .skills.install = {
-              "nodeManager": "npm"
-            } |
-            .skills.entries = (.skills.entries // {})
-          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-          echo "Skills configuration patched"
-          echo "::endgroup::"
-
-      - name: Patch OpenClaw config for Hooks
-        run: |
-          set -euo pipefail
-          echo "::group::Patching OpenClaw config for Hooks"
-
-          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
-
-          # Hooks: skip for now (as per user's manual onboarding)
-          jq '
+            .skills.install = { "nodeManager": "npm" } |
+            .skills.entries = (.skills.entries // {}) |
             .hooks = (.hooks // {}) |
-            .hooks.internal = {
-              "enabled": false,
-              "entries": {}
-            }
+            .hooks.internal = { "enabled": false, "entries": {} }
           ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-          echo "Hooks configuration patched (skipped)"
+          echo "Skills and Hooks configuration patched"
           echo "::endgroup::"
 
       - name: Install clawhub skill
@@ -298,19 +293,17 @@ jobs:
           set -euo pipefail
           echo "::group::Installing clawhub skill"
 
-          # Ensure workspace exists
           mkdir -p "$HOME/.openclaw/workspace"
 
-          # Install clawhub - this is the main skill dependency
-          openclaw skills install clawhub --node-manager npm || {
-            echo "::warning::clawhub skill install failed - this may be expected in CI"
-            echo "The skill can be installed manually later"
+          # Install clawhub - the main skill dependency
+          openclaw skills install clawhub || {
+            echo "::warning::clawhub skill install failed - continuing without it"
           }
 
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
-      # 7. Verify and display final configuration
+      # 7. Verify final configuration
       # ──────────────────────────────────────────────
 
       - name: Verify final configuration
@@ -320,8 +313,7 @@ jobs:
 
           CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-          echo "=== Final OpenClaw Config ==="
-          # Redact sensitive values
+          echo "=== Final OpenClaw Config (redacted) ==="
           jq '
             if .channels?.discord?.token then
               .channels.discord.token = "***REDACTED***"
@@ -344,16 +336,11 @@ jobs:
             echo "CLIProxyAPI is running (PID: $PROXY_PID)"
             TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
             echo "Qwen tokens loaded: $TOKEN_COUNT"
-            echo "API endpoint: http://127.0.0.1:8317/v1"
-            echo "Routing strategy: round-robin"
           else
-            echo "::warning::CLIProxyAPI is not running"
+            echo "::error::CLIProxyAPI is NOT running!"
+            cat /tmp/cliproxyapi.log || true
+            exit 1
           fi
-
-          echo ""
-          echo "=== OpenClaw Gateway ==="
-          # Try to check gateway status
-          openclaw health --timeout 5000 2>/dev/null || echo "Gateway health check: skipped or unavailable"
 
           echo ""
           echo "=== Configuration Summary ==="
@@ -361,59 +348,144 @@ jobs:
           echo "Model: qwen3-coder-plus"
           echo "API Base: http://127.0.0.1:8317/v1"
           echo "Channel: Discord (Open access)"
-          echo "Skills: clawhub (npm)"
-          echo "Hooks: Skipped"
 
           echo "::endgroup::"
 
       - name: Show summary
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
-          ## OpenClaw Onboarding Complete
+          ## OpenClaw Running
 
           ### Configuration
           | Setting | Value |
           |---------|-------|
-          | LLM Provider | Custom (CLIProxyAPI -> Qwen Code) |
+          | LLM Provider | Custom (CLIProxyAPI -> Qwen) |
           | Model | `qwen3-coder-plus` |
           | API Endpoint | `http://127.0.0.1:8317/v1` |
           | Routing | Round-robin across all Qwen tokens |
           | Channel | Discord (Open access - all channels) |
-          | Skills | clawhub (npm) |
-          | Hooks | Skipped |
           | Gateway | Local (port 18789, loopback, token auth) |
+          | Timeout | 6 hours |
 
-          ### How It Works
-          1. **CLIProxyAPI** decrypts your Qwen tokens and provides an OpenAI-compatible API
-          2. **OpenClaw** connects to CLIProxyAPI as a "custom provider"
-          3. **Discord** bot is configured with open channel access
-          4. **Round-robin** load balancing distributes requests across all Qwen accounts
-
-          ### Encryption
-          - Algorithm: AES-256-CBC with PBKDF2 (via openssl)
-          - Tokens are base64-encoded after encryption
-          - Same scheme as the Strix/Qwen.yml token collection workflow
-
-          ### Next Steps
-          - Monitor the gateway: `openclaw dashboard`
-          - Check health: `openclaw health`
-          - Configure more channels: `openclaw channels add`
-          - Add skills: `openclaw skills install <name>`
-          - Enable hooks: `openclaw hooks enable <name>`
+          ### Status
+          The OpenClaw gateway is running with Discord connected.
+          The bot should be online and responding to messages.
+          The workflow will keep running for up to 6 hours or until manually cancelled.
           EOF
 
       # ──────────────────────────────────────────────
-      # 8. Cleanup
+      # 8. Start OpenClaw gateway and keep alive
       # ──────────────────────────────────────────────
 
-      - name: Cleanup sensitive data
-        if: always()
+      - name: Start OpenClaw gateway and run indefinitely
+        env:
+          DISCORD_BOT_TOKEN: ${{ github.event.inputs.discord_bot_token }}
         run: |
-          # Kill CLIProxyAPI
-          kill $PROXY_PID 2>/dev/null || true
+          set -euo pipefail
 
-          # Remove token files
-          rm -f "$AUTH_DIR"/qwen-*.json 2>/dev/null || true
-          rm -f /tmp/cliproxyapi.log 2>/dev/null || true
+          echo "============================================"
+          echo "  Starting OpenClaw Gateway + Discord Bot"
+          echo "============================================"
+          echo ""
 
-          echo "Sensitive data cleaned up"
+          # Verify CLIProxyAPI is still running
+          if ! kill -0 $PROXY_PID 2>/dev/null; then
+            echo "::error::CLIProxyAPI died before gateway start!"
+            cat /tmp/cliproxyapi.log || true
+            exit 1
+          fi
+          echo "CLIProxyAPI is alive (PID: $PROXY_PID)"
+
+          # Start the OpenClaw gateway directly (systemd doesn't work well in GitHub Actions)
+          # The gateway connects to Discord, handles messages, and proxies to CLIProxyAPI
+          echo "Starting OpenClaw gateway..."
+          nohup openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &
+          GATEWAY_PID=$!
+          echo "Gateway started (PID: $GATEWAY_PID)"
+
+          # Give the gateway time to initialize and connect to Discord
+          echo "Waiting for gateway to initialize..."
+          sleep 15
+
+          # Check if gateway is still running
+          if ! kill -0 $GATEWAY_PID 2>/dev/null; then
+            echo "::error::Gateway process died during startup!"
+            echo "=== Gateway logs ==="
+            cat /tmp/openclaw-gateway.log || true
+            echo "=== CLIProxyAPI logs ==="
+            cat /tmp/cliproxyapi.log || true
+            exit 1
+          fi
+
+          echo ""
+          echo "Gateway is running!"
+          echo ""
+
+          # Show initial gateway logs
+          echo "=== Initial Gateway Logs ==="
+          cat /tmp/openclaw-gateway.log || true
+          echo "=== End Initial Logs ==="
+          echo ""
+
+          # Check gateway health
+          openclaw health --timeout 10000 2>/dev/null && echo "Health check: PASSED" || echo "Health check: gateway may still be initializing"
+
+          echo ""
+          echo "============================================"
+          echo "  OpenClaw is LIVE! Discord bot is online."
+          echo "  The workflow will keep running for ~6 hours."
+          echo "  Cancel this workflow to stop the bot."
+          echo "============================================"
+          echo ""
+
+          # Keep-alive loop: monitor processes and print status every 5 minutes
+          ITERATION=0
+          while true; do
+            ITERATION=$((ITERATION + 1))
+
+            # Check if CLIProxyAPI is alive
+            if ! kill -0 $PROXY_PID 2>/dev/null; then
+              echo ""
+              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [ERROR] CLIProxyAPI (PID: $PROXY_PID) died!"
+              echo "=== CLIProxyAPI logs ==="
+              tail -50 /tmp/cliproxyapi.log || true
+
+              # Try to restart CLIProxyAPI
+              echo "Attempting to restart CLIProxyAPI..."
+              nohup cliproxyapi -config "$AUTH_DIR/config.yaml" > /tmp/cliproxyapi.log 2>&1 &
+              PROXY_PID=$!
+              echo "CLIProxyAPI restarted (PID: $PROXY_PID)"
+              sleep 5
+            fi
+
+            # Check if gateway is alive
+            if ! kill -0 $GATEWAY_PID 2>/dev/null; then
+              echo ""
+              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [ERROR] Gateway (PID: $GATEWAY_PID) died!"
+              echo "=== Gateway logs ==="
+              tail -50 /tmp/openclaw-gateway.log || true
+
+              # Try to restart gateway
+              echo "Attempting to restart gateway..."
+              nohup openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &
+              GATEWAY_PID=$!
+              echo "Gateway restarted (PID: $GATEWAY_PID)"
+              sleep 10
+            fi
+
+            # Print status every 5 minutes (every 10 iterations of 30s sleep)
+            if [ $((ITERATION % 10)) -eq 0 ]; then
+              UPTIME_MIN=$((ITERATION * 30 / 60))
+              echo ""
+              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [STATUS] Uptime: ~${UPTIME_MIN}m | CLIProxyAPI PID: $PROXY_PID | Gateway PID: $GATEWAY_PID"
+
+              # Print last few lines of logs
+              echo "--- Recent gateway logs ---"
+              tail -5 /tmp/openclaw-gateway.log 2>/dev/null || true
+              echo "--- Recent CLIProxyAPI logs ---"
+              tail -5 /tmp/cliproxyapi.log 2>/dev/null || true
+              echo "---"
+            fi
+
+            sleep 30
+          done
