@@ -776,24 +776,20 @@ jobs:
 
           CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 
-          # The `openclaw skills install` CLI command changed across versions.
-          # Instead of relying on the CLI, patch the config directly to register
-          # the clawhub skill from the official NPM registry.
-          # First, try the CLI approach (may work on some versions):
-          if openclaw skills install clawhub 2>/dev/null; then
-            echo "clawhub installed via CLI"
-          else
-            echo "CLI install failed — patching config directly"
-            # Add clawhub to skills.entries in the config JSON
-            jq '
-              .skills.entries["@openclaw/clawhub"] = {
-                "enabled": true,
-                "source": "npm:@openclaw/clawhub@latest"
-              }
-            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" && echo "clawhub added to config" || {
-              echo "::warning::Could not add clawhub skill - continuing without it"
+          # Register the clawhub skill in the config.
+          # The OpenClaw config schema for skills.entries is strict — only
+          # these keys are allowed: enabled, apiKey, env, config.
+          # Any other key (e.g. "source") causes a validation error and
+          # crashes the gateway with "Unrecognized key".
+          # clawhub is a bundled/workspace skill that OpenClaw discovers
+          # automatically once enabled here.
+          jq '
+            .skills.entries["@openclaw/clawhub"] = {
+              "enabled": true
             }
-          fi
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" && echo "clawhub skill enabled in config" || {
+            echo "::warning::Could not add clawhub skill - continuing without it"
+          }
 
           echo "::endgroup::"
 
@@ -824,6 +820,38 @@ jobs:
               .gateway.auth.token = "***REDACTED***"
             else . end
           ' "$CONFIG_FILE"
+
+          # Validate that skill entries don't contain unrecognized keys.
+          # The OpenClaw schema only allows: enabled, apiKey, env, config.
+          # Any other key will cause the gateway to crash.
+          echo ""
+          echo "=== Config Schema Pre-Check ==="
+          INVALID_KEYS=$(jq -r '
+            .skills.entries // {} | to_entries[] |
+            .key as $skill |
+            .value | keys[] |
+            select(. != "enabled" and . != "apiKey" and . != "env" and . != "config") |
+            "\($skill): unrecognized key \"\(.)\""
+          ' "$CONFIG_FILE" 2>/dev/null || true)
+
+          if [ -n "$INVALID_KEYS" ]; then
+            echo "::error::Config has invalid skill entry keys that will crash the gateway!"
+            echo "$INVALID_KEYS"
+            echo ""
+            echo "Attempting auto-fix: stripping unrecognized keys..."
+            jq '
+              .skills.entries //= {} |
+              .skills.entries |= with_entries(
+                .value |= with_entries(
+                  select(.key == "enabled" or .key == "apiKey" or .key == "env" or .key == "config")
+                )
+              )
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            echo "Auto-fix applied. Cleaned config skill entries:"
+            jq '.skills.entries' "$CONFIG_FILE"
+          else
+            echo "Skill entries schema OK (no unrecognized keys)"
+          fi
 
           echo ""
           echo "=== CLIProxyAPI Status ==="
@@ -901,6 +929,31 @@ jobs:
           The bot should be online and responding to messages.
           The workflow will keep running for up to 6 hours or until manually cancelled.
           EOF
+
+      # ──────────────────────────────────────────────
+      # 7.5. Run doctor --fix to clean up any config issues
+      # ──────────────────────────────────────────────
+
+      - name: Run OpenClaw doctor --fix
+        run: |
+          set -euo pipefail
+          echo "::group::Running openclaw doctor --fix"
+
+          # doctor --fix removes unrecognized keys and applies
+          # recommended changes (e.g. enabling Discord when token
+          # is present). This is a safety net in case any config
+          # patching introduced unknown fields.
+          if openclaw doctor --fix 2>&1; then
+            echo "Doctor completed successfully"
+          else
+            echo "::warning::Doctor exited with non-zero status — continuing anyway"
+          fi
+
+          echo ""
+          echo "Config after doctor --fix:"
+          jq '.' "$HOME/.openclaw/openclaw.json" 2>/dev/null | head -80 || true
+
+          echo "::endgroup::"
 
       # ──────────────────────────────────────────────
       # 8. Start OpenClaw gateway and keep alive
