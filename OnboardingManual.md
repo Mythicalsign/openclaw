@@ -469,27 +469,67 @@ The decrypted `qwen-*.json` files go into CLIProxyAPI's auth directory.
 ### Workflow Inputs (workflow_dispatch):
 | Input | Description | Required |
 |-------|-------------|----------|
-| `encrypted_tokens` | Base64-encoded AES-256-CBC encrypted Qwen tokens | Yes |
+| `llm_provider` | Dropdown: `qwen (Qwen3 Coder Plus)` or `gemini (Gemini 2.5 Pro via Gemini CLI tokens)` | Yes |
+| `encrypted_tokens` | Base64-encoded AES-256-CBC encrypted tokens (Qwen **or** Gemini CLI, depending on provider choice) | Yes |
 | `decryption_password` | Password used to encrypt the tokens | Yes |
 | `discord_bot_token` | Discord bot token for channel setup | Yes |
 
+### Provider Selection (Dropdown):
+| Choice | Model ID | Context Window | Max Tokens | Token File Pattern |
+|--------|----------|----------------|------------|--------------------|
+| `qwen (Qwen3 Coder Plus via encrypted tokens)` | `qwen3-coder-plus` | 131,072 | 32,768 | `qwen-*.json` |
+| `gemini (Gemini 2.5 Pro via encrypted Gemini CLI tokens)` | `gemini-2.5-pro` | 1,048,576 | 65,536 | `gemini-cli-*.json` |
+
+### Context Window Fix (CRITICAL):
+OpenClaw's non-interactive onboarding with `custom-api-key` defaults the model's `contextWindow` to **4096 tokens**.
+However, OpenClaw requires a **minimum of 16000 tokens** for the context window. This caused the error:
+```
+Model context window too small (4096 tokens). Minimum is 16000.
+```
+
+The workflow now patches `~/.openclaw/openclaw.json` after onboarding to set the correct `contextWindow` and `maxTokens` values using `jq`. This is done in the **"Fix model context window"** step.
+
+### Gemini CLI Token Encryption:
+To use Gemini CLI tokens, encrypt them the same way as Qwen tokens:
+```bash
+# 1. Collect Gemini CLI token files (typically from ~/.gemini/oauth_creds.json or via cliproxyapi -gemini-login)
+#    CLIProxyAPI stores them as gemini-cli-*.json files in its auth directory
+
+# 2. Tar them together
+tar -czf gemini-tokens.tar.gz gemini-cli-*.json
+
+# 3. Encrypt with AES-256-CBC
+openssl enc -aes-256-cbc -salt -pbkdf2 \
+  -in gemini-tokens.tar.gz \
+  -out gemini-tokens.enc \
+  -pass pass:'<your_password>'
+
+# 4. Base64 encode
+base64 -w 0 gemini-tokens.enc
+
+# 5. Store the base64 string as the encrypted_tokens input
+```
+
 ### Automation Strategy:
-1. **Install Node.js >= 22** (required by OpenClaw)
-2. **Install Go** (required to build CLIProxyAPI from source)
-3. **Install OpenClaw** globally via npm
-4. **Build CLIProxyAPI** from source
-5. **Decrypt tokens** and place in CLIProxyAPI auth directory
-6. **Create CLIProxyAPI config** with round-robin strategy
-7. **Start CLIProxyAPI** in background
-8. **Run OpenClaw non-interactive onboarding** with custom-api-key pointing to CLIProxyAPI
-9. **Patch config** for Discord, skills, and hooks (since non-interactive skips these)
-10. **Install daemon** and start the gateway
+1. **Determine provider** from dropdown selection (Qwen or Gemini)
+2. **Install Node.js >= 22** (required by OpenClaw)
+3. **Install Go** (required to build CLIProxyAPI from source)
+4. **Install OpenClaw** globally via npm
+5. **Build CLIProxyAPI** from source
+6. **Decrypt tokens** (Qwen `qwen-*.json` or Gemini `gemini-cli-*.json`) and place in CLIProxyAPI auth directory
+7. **Create CLIProxyAPI config** with round-robin strategy
+8. **Start CLIProxyAPI** in background
+9. **Run OpenClaw non-interactive onboarding** with custom-api-key pointing to CLIProxyAPI
+10. **CRITICAL: Patch contextWindow and maxTokens** in `openclaw.json` to fix the 4096 token default
+11. **Patch config** for Discord, skills, and hooks (since non-interactive skips these)
+12. **Start the gateway** and keep alive
 
 ### Key Decisions:
-- **Model name**: `qwen3-coder-plus` (confirmed from CLIProxyAPI config.example.yaml)
+- **Model name**: Depends on dropdown — `qwen3-coder-plus` or `gemini-2.5-pro`
 - **API endpoint**: `http://127.0.0.1:8317/v1` (CLIProxyAPI default port)
-- **Compatibility**: `openai` (CLIProxyAPI provides OpenAI-compatible endpoints)
+- **Compatibility**: `openai` (CLIProxyAPI provides OpenAI-compatible endpoints for all providers)
 - **API key**: `dummykey` (CLIProxyAPI uses its own auth; the key just needs to match its config)
+- **Context window**: Set to proper values per model (131072 for Qwen, 1048576 for Gemini) — NOT the 4096 default
 
 ---
 
@@ -527,12 +567,20 @@ The decrypted `qwen-*.json` files go into CLIProxyAPI's auth directory.
 
 5. **The Qwen model name is `qwen3-coder-plus`** (confirmed from CLIProxyAPI config.example.yaml oauth-model-alias section).
 
-6. **Discord "Open (allow all channels)"** maps to `groupPolicy: "open"` in config JSON.
+6. **The Gemini model name is `gemini-2.5-pro`** (the primary model available through Gemini CLI OAuth).
 
-7. **Skills "clawhub"** is the main installable skill dependency. Install via `openclaw` post-onboarding or patch config.
+7. **Discord "Open (allow all channels)"** maps to `groupPolicy: "open"` in config JSON.
 
-8. **The gateway port default is 18789**. CLIProxyAPI uses port 8317.
+8. **Skills "clawhub"** is the main installable skill dependency. Install via `openclaw` post-onboarding or patch config.
 
-9. **Config file location**: `~/.openclaw/openclaw.json`
+9. **The gateway port default is 18789**. CLIProxyAPI uses port 8317.
 
-10. **Workspace location**: `~/.openclaw/workspace/`
+10. **Config file location**: `~/.openclaw/openclaw.json`
+
+11. **Workspace location**: `~/.openclaw/workspace/`
+
+12. **CRITICAL: contextWindow must be patched after onboarding.** The `custom-api-key` auth-choice defaults to `contextWindow: 4096` which is below OpenClaw's minimum of 16000. The workflow now patches this automatically using `jq` to set proper values per model.
+
+13. **CLIProxyAPI supports multiple providers.** It can proxy Qwen, Gemini CLI, Claude Code, OpenAI Codex, and more. Token files are differentiated by naming pattern: `qwen-*.json` for Qwen, `gemini-cli-*.json` for Gemini CLI.
+
+14. **Provider selection via workflow dropdown.** The `llm_provider` input lets users choose between Qwen and Gemini. The workflow automatically sets the correct model ID, context window, max tokens, and token file pattern based on the selection.

@@ -3,8 +3,16 @@ name: OpenClaw Automated Onboarding
 on:
   workflow_dispatch:
     inputs:
+      llm_provider:
+        description: 'LLM provider to use'
+        required: true
+        type: choice
+        options:
+          - 'qwen (Qwen3 Coder Plus via encrypted tokens)'
+          - 'gemini (Gemini 2.5 Pro via encrypted Gemini CLI tokens)'
+        default: 'qwen (Qwen3 Coder Plus via encrypted tokens)'
       encrypted_tokens:
-        description: 'Encrypted Qwen tokens (base64-encoded AES-256-CBC from Strix/Qwen.yml)'
+        description: 'Encrypted tokens (base64-encoded AES-256-CBC) — Qwen tokens OR Gemini CLI tokens depending on provider choice'
         required: true
         type: string
       decryption_password:
@@ -34,6 +42,32 @@ jobs:
           echo "::add-mask::${{ github.event.inputs.encrypted_tokens }}"
           echo "::add-mask::${{ github.event.inputs.decryption_password }}"
           echo "::add-mask::${{ github.event.inputs.discord_bot_token }}"
+
+      # ──────────────────────────────────────────────
+      # 0.5. Determine provider and model from dropdown
+      # ──────────────────────────────────────────────
+
+      - name: Determine LLM provider and model
+        run: |
+          set -euo pipefail
+          PROVIDER_CHOICE="${{ github.event.inputs.llm_provider }}"
+          echo "Provider choice: $PROVIDER_CHOICE"
+
+          if [[ "$PROVIDER_CHOICE" == *"gemini"* ]]; then
+            echo "PROVIDER=gemini" >> "$GITHUB_ENV"
+            echo "MODEL_ID=gemini-2.5-pro" >> "$GITHUB_ENV"
+            echo "CONTEXT_WINDOW=1048576" >> "$GITHUB_ENV"
+            echo "MAX_TOKENS=65536" >> "$GITHUB_ENV"
+            echo "TOKEN_PATTERN=gemini-cli-*.json" >> "$GITHUB_ENV"
+            echo "Selected: Gemini 2.5 Pro (context: 1048576, maxTokens: 65536)"
+          else
+            echo "PROVIDER=qwen" >> "$GITHUB_ENV"
+            echo "MODEL_ID=qwen3-coder-plus" >> "$GITHUB_ENV"
+            echo "CONTEXT_WINDOW=131072" >> "$GITHUB_ENV"
+            echo "MAX_TOKENS=32768" >> "$GITHUB_ENV"
+            echo "TOKEN_PATTERN=qwen-*.json" >> "$GITHUB_ENV"
+            echo "Selected: Qwen3 Coder Plus (context: 131072, maxTokens: 32768)"
+          fi
 
       # ──────────────────────────────────────────────
       # 1. Setup runtimes
@@ -109,13 +143,13 @@ jobs:
       # 4. Decrypt tokens and set up CLIProxyAPI
       # ──────────────────────────────────────────────
 
-      - name: Decrypt Qwen tokens
+      - name: Decrypt tokens
         env:
           ENCRYPTED_TOKENS: ${{ github.event.inputs.encrypted_tokens }}
           DECRYPTION_PASSWORD: ${{ github.event.inputs.decryption_password }}
         run: |
           set -euo pipefail
-          echo "::group::Decrypting Qwen tokens"
+          echo "::group::Decrypting $PROVIDER tokens"
 
           AUTH_DIR="$HOME/.cli-proxy-api"
           mkdir -p "$AUTH_DIR"
@@ -125,23 +159,30 @@ jobs:
           cd "$TEMP_DIR"
 
           # Decode base64
-          echo "$ENCRYPTED_TOKENS" | base64 -d > qwen-tokens.enc
+          echo "$ENCRYPTED_TOKENS" | base64 -d > tokens.enc
 
-          # Decrypt with AES-256-CBC (same scheme as Strix/Qwen.yml)
+          # Decrypt with AES-256-CBC
           openssl enc -aes-256-cbc -d -salt -pbkdf2 \
-            -in qwen-tokens.enc \
-            -out qwen-tokens.tar.gz \
+            -in tokens.enc \
+            -out tokens.tar.gz \
             -pass pass:"$DECRYPTION_PASSWORD"
 
           # Extract token files into auth directory
-          tar -xzf qwen-tokens.tar.gz -C "$AUTH_DIR"
+          tar -xzf tokens.tar.gz -C "$AUTH_DIR"
 
-          TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
-          echo "Decrypted $TOKEN_COUNT Qwen token file(s)"
+          # Count token files based on provider
+          TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name "$TOKEN_PATTERN" 2>/dev/null | wc -l)
+          echo "Decrypted $TOKEN_COUNT $PROVIDER token file(s)"
 
           if [ "$TOKEN_COUNT" -eq 0 ]; then
-            echo "::error::No Qwen token files found after decryption!"
+            echo "::error::No $PROVIDER token files found after decryption!"
+            echo "Expected pattern: $TOKEN_PATTERN"
+            echo "Files found in auth dir:"
+            ls -la "$AUTH_DIR/" || true
+            echo ""
             echo "Verify the encrypted_tokens input and decryption_password are correct."
+            echo "For Qwen: token files should be named qwen-*.json"
+            echo "For Gemini: token files should be named gemini-cli-*.json"
             rm -rf "$TEMP_DIR"
             exit 1
           fi
@@ -241,12 +282,14 @@ jobs:
           set -euo pipefail
           echo "::group::Running OpenClaw onboarding"
 
+          echo "Onboarding with model: $MODEL_ID"
+
           openclaw onboard --non-interactive --accept-risk \
             --flow quickstart \
             --auth-choice custom-api-key \
             --custom-base-url "http://127.0.0.1:8317/v1" \
             --custom-api-key "dummykey" \
-            --custom-model-id "qwen3-coder-plus" \
+            --custom-model-id "$MODEL_ID" \
             --custom-compatibility openai \
             --skip-channels \
             --skip-skills \
@@ -254,6 +297,60 @@ jobs:
             --skip-ui
 
           echo "Non-interactive onboarding completed"
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 5.5. CRITICAL FIX: Patch contextWindow and maxTokens
+      #      OpenClaw defaults custom models to contextWindow: 4096
+      #      but requires minimum 16000 tokens. This patch fixes the
+      #      "Model context window too small (4096 tokens)" error.
+      # ──────────────────────────────────────────────
+
+      - name: Fix model context window (patch contextWindow and maxTokens)
+        run: |
+          set -euo pipefail
+          echo "::group::Fixing model context window"
+
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::OpenClaw config file not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          echo "Before fix - model config:"
+          jq '.models.providers' "$CONFIG_FILE" 2>/dev/null || echo "(could not read models)"
+
+          # Patch ALL models in ALL providers to have correct contextWindow and maxTokens.
+          # This fixes the "Model context window too small (4096 tokens). Minimum is 16000." error.
+          # The contextWindow default for custom-api-key models is 4096 which is too small.
+          jq --argjson ctx "$CONTEXT_WINDOW" --argjson maxTok "$MAX_TOKENS" '
+            if .models.providers then
+              .models.providers |= with_entries(
+                .value.models = [
+                  .value.models[] |
+                  .contextWindow = $ctx |
+                  .maxTokens = $maxTok
+                ]
+              )
+            else . end
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+          echo ""
+          echo "After fix - model config:"
+          jq '.models.providers' "$CONFIG_FILE"
+
+          # Verify the fix worked
+          ACTUAL_CTX=$(jq -r '[.models.providers[].models[].contextWindow] | first' "$CONFIG_FILE" 2>/dev/null || echo "0")
+          echo ""
+          echo "Verified contextWindow: $ACTUAL_CTX (required minimum: 16000)"
+
+          if [ "$ACTUAL_CTX" -lt 16000 ]; then
+            echo "::error::contextWindow is still below 16000 after patching!"
+            exit 1
+          fi
+
+          echo "Context window fix applied successfully!"
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
@@ -354,8 +451,10 @@ jobs:
           echo "=== CLIProxyAPI Status ==="
           if kill -0 $PROXY_PID 2>/dev/null; then
             echo "CLIProxyAPI is running (PID: $PROXY_PID)"
-            TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
-            echo "Qwen tokens loaded: $TOKEN_COUNT"
+            QWEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
+            GEMINI_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'gemini-cli-*.json' 2>/dev/null | wc -l)
+            echo "Qwen tokens loaded: $QWEN_COUNT"
+            echo "Gemini CLI tokens loaded: $GEMINI_COUNT"
           else
             echo "::error::CLIProxyAPI is NOT running!"
             cat /tmp/cliproxyapi.log || true
@@ -364,8 +463,10 @@ jobs:
 
           echo ""
           echo "=== Configuration Summary ==="
-          echo "LLM Provider: Custom (CLIProxyAPI -> Qwen)"
-          echo "Model: qwen3-coder-plus"
+          echo "LLM Provider: Custom (CLIProxyAPI -> $PROVIDER)"
+          echo "Model: $MODEL_ID"
+          echo "Context Window: $CONTEXT_WINDOW"
+          echo "Max Tokens: $MAX_TOKENS"
           echo "API Base: http://127.0.0.1:8317/v1"
           echo "Channel: Discord (Open access)"
 
@@ -373,19 +474,25 @@ jobs:
 
       - name: Show summary
         run: |
-          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          cat << EOF >> $GITHUB_STEP_SUMMARY
           ## OpenClaw Running
 
           ### Configuration
           | Setting | Value |
           |---------|-------|
-          | LLM Provider | Custom (CLIProxyAPI -> Qwen) |
-          | Model | `qwen3-coder-plus` |
-          | API Endpoint | `http://127.0.0.1:8317/v1` |
-          | Routing | Round-robin across all Qwen tokens |
+          | LLM Provider | Custom (CLIProxyAPI -> $PROVIDER) |
+          | Model | \`$MODEL_ID\` |
+          | Context Window | $CONTEXT_WINDOW tokens |
+          | Max Tokens | $MAX_TOKENS tokens |
+          | API Endpoint | \`http://127.0.0.1:8317/v1\` |
+          | Routing | Round-robin across all $PROVIDER tokens |
           | Channel | Discord (Open access - all channels) |
           | Gateway | Local (port 18789, loopback, token auth) |
           | Timeout | 6 hours |
+
+          ### Context Window Fix
+          The workflow patches the model's \`contextWindow\` from the default 4096 to $CONTEXT_WINDOW tokens.
+          This fixes the "Model context window too small (4096 tokens). Minimum is 16000." error.
 
           ### Status
           The OpenClaw gateway is running with Discord connected.
@@ -405,6 +512,8 @@ jobs:
 
           echo "============================================"
           echo "  Starting OpenClaw Gateway + Discord Bot"
+          echo "  Provider: $PROVIDER | Model: $MODEL_ID"
+          echo "  Context Window: $CONTEXT_WINDOW tokens"
           echo "============================================"
           echo ""
 
