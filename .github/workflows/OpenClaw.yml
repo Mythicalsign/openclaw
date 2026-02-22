@@ -213,9 +213,6 @@ jobs:
           request-retry: 1
           EOF
 
-          # Fix indentation (remove leading whitespace from heredoc)
-          sed -i 's/^          //' "$AUTH_DIR/config.yaml"
-
           echo "CLIProxyAPI config created"
           cat "$AUTH_DIR/config.yaml"
           echo "::endgroup::"
@@ -245,7 +242,7 @@ jobs:
             # Try health check with auth header
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer dummykey" \
-              http://127.0.0.1:8317/v1/models 2>/dev/null || echo "000")
+              http://127.0.0.1:8317/v1/models 2>/dev/null | head -c3 || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
               echo "CLIProxyAPI is ready! (HTTP $HTTP_CODE)"
@@ -308,6 +305,7 @@ jobs:
           let totalForwarded = 0;
           let total429Caught = 0;
           let totalRetries = 0;
+          let totalStreamed = 0;
           let queueHighWater = 0;
 
           // ── Sliding-window rate limiter ────────────────
@@ -316,11 +314,6 @@ jobs:
             while (timestamps.length > 0 && timestamps[0] < cutoff) {
               timestamps.shift();
             }
-          }
-
-          function canSendNow() {
-            pruneWindow();
-            return timestamps.length < RPM_LIMIT;
           }
 
           function recordRequest() {
@@ -334,15 +327,11 @@ jobs:
           }
 
           // ── Serial queue ──────────────────────────────
-          // Ensures only one request at a time goes upstream so the sliding
-          // window is always accurate, while the LLM is generating.
           const queue = [];
           let processing = false;
 
           function enqueue(task) {
-            if (queue.length >= MAX_QUEUE) {
-              return false;
-            }
+            if (queue.length >= MAX_QUEUE) return false;
             queue.push(task);
             if (queue.length > queueHighWater) queueHighWater = queue.length;
             drainQueue();
@@ -354,26 +343,20 @@ jobs:
             processing = true;
             while (queue.length > 0) {
               const task = queue.shift();
-              try {
-                await task();
-              } catch (e) {
-                log(`[ERROR] Task failed: ${e.message}`);
-              }
+              try { await task(); } catch (e) { log(`[ERROR] Task failed: ${e.message}`); }
             }
             processing = false;
           }
 
           // ── Helpers ───────────────────────────────────
           function log(msg) {
-            const ts = new Date().toISOString();
-            console.log(`${ts} [rate-limit-proxy] ${msg}`);
+            console.log(`${new Date().toISOString()} [rate-limit-proxy] ${msg}`);
           }
 
           function sleep(ms) {
             return new Promise((r) => setTimeout(r, ms));
           }
 
-          // ── Read full body from IncomingMessage ───────
           function readBody(stream) {
             return new Promise((resolve, reject) => {
               const chunks = [];
@@ -383,8 +366,71 @@ jobs:
             });
           }
 
-          // ── Forward one request to upstream ───────────
-          function forwardRequest(method, url, headers, body) {
+          // ── Peek request: read ONLY status + headers, buffer first chunk ──
+          // Returns { statusCode, headers, firstChunk, upstreamRes } so we can
+          // decide whether to retry (429) or stream through. Does NOT consume
+          // the full body.
+          function peekUpstream(method, url, headers, body) {
+            return new Promise((resolve, reject) => {
+              const opts = {
+                hostname: UPSTREAM_HOST,
+                port: UPSTREAM_PORT,
+                path: url,
+                method,
+                headers: { ...headers, host: `${UPSTREAM_HOST}:${UPSTREAM_PORT}` },
+                timeout: UPSTREAM_TIMEOUT,
+              };
+
+              const upstream = http.request(opts, (upRes) => {
+                // Pause the stream until we decide what to do
+                upRes.pause();
+
+                resolve({
+                  statusCode: upRes.statusCode,
+                  headers: upRes.headers,
+                  upstreamRes: upRes,
+                });
+              });
+
+              upstream.on("timeout", () => {
+                upstream.destroy(new Error("upstream timeout"));
+              });
+              upstream.on("error", reject);
+
+              if (body && body.length > 0) upstream.write(body);
+              upstream.end();
+            });
+          }
+
+          // ── Drain and discard an upstream response (for 429 retries) ──
+          function discardResponse(upstreamRes) {
+            return new Promise((resolve) => {
+              upstreamRes.resume();
+              upstreamRes.on("end", resolve);
+              upstreamRes.on("error", resolve); // ignore errors during discard
+            });
+          }
+
+          // ── Pipe upstream response to client (streaming) ──────────
+          function pipeResponse(upstreamRes, res) {
+            return new Promise((resolve, reject) => {
+              upstreamRes.resume();
+              upstreamRes.pipe(res);
+              upstreamRes.on("end", resolve);
+              upstreamRes.on("error", (err) => {
+                res.destroy(err);
+                reject(err);
+              });
+              res.on("close", () => {
+                // Client disconnected early — destroy upstream to free resources
+                if (!upstreamRes.destroyed) upstreamRes.destroy();
+                resolve();
+              });
+            });
+          }
+
+          // ── Forward non-completions requests (buffered, simple) ───
+          function forwardBuffered(method, url, headers, body) {
             return new Promise((resolve, reject) => {
               const opts = {
                 hostname: UPSTREAM_HOST,
@@ -399,70 +445,64 @@ jobs:
                 const chunks = [];
                 upRes.on("data", (c) => chunks.push(c));
                 upRes.on("end", () => {
-                  resolve({
-                    statusCode: upRes.statusCode,
-                    headers: upRes.headers,
-                    body: Buffer.concat(chunks),
-                  });
+                  resolve({ statusCode: upRes.statusCode, headers: upRes.headers, body: Buffer.concat(chunks) });
                 });
                 upRes.on("error", reject);
               });
 
-              upstream.on("timeout", () => {
-                upstream.destroy(new Error("upstream timeout"));
-              });
+              upstream.on("timeout", () => upstream.destroy(new Error("upstream timeout")));
               upstream.on("error", reject);
 
-              if (body && body.length > 0) {
-                upstream.write(body);
-              }
+              if (body && body.length > 0) upstream.write(body);
               upstream.end();
             });
           }
 
-          // ── Handle a single proxied request ───────────
+          // ── Handle a single proxied completions request ───────────
+          // Strategy: peek at the status code first. If 429, discard the
+          // response, backoff, and retry. If 200, pipe the full response
+          // (including SSE stream) directly to the client with zero buffering.
           async function handleRequest(req, res, body) {
-            let lastErr = null;
-
             for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-              // Wait for a slot in the sliding window
+              // Wait for a rate-limit slot
               let waitMs = msUntilSlotFrees();
               while (waitMs > 0) {
-                log(`[THROTTLE] Waiting ${(waitMs / 1000).toFixed(1)}s for rate window to clear (attempt ${attempt + 1}/${MAX_RETRIES + 1}, queue=${queue.length})`);
+                log(`[THROTTLE] Waiting ${(waitMs / 1000).toFixed(1)}s for rate window (attempt ${attempt + 1}/${MAX_RETRIES + 1}, queue=${queue.length})`);
                 await sleep(waitMs);
                 waitMs = msUntilSlotFrees();
               }
 
-              // Record this request and forward
               recordRequest();
               totalForwarded++;
 
               try {
-                const upRes = await forwardRequest(req.method, req.url, req.headers, body);
+                const peek = await peekUpstream(req.method, req.url, req.headers, body);
 
-                if (upRes.statusCode === 429) {
+                if (peek.statusCode === 429) {
                   total429Caught++;
-                  // Exponential backoff: 62s, 93s, ~140s, capped at 180s
+                  // Discard the 429 response body before retrying
+                  await discardResponse(peek.upstreamRes);
+
                   const backoff = Math.min(BASE_WAIT_MS * Math.pow(1.5, attempt), MAX_WAIT_MS);
-                  // Jitter: +/- 10%
                   const jitter = backoff * (0.9 + Math.random() * 0.2);
-                  log(`[429 CAUGHT] Upstream returned 429 (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Waiting ${(jitter / 1000).toFixed(1)}s before retry...`);
+                  log(`[429 CAUGHT] Upstream 429 (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Backoff ${(jitter / 1000).toFixed(1)}s`);
                   totalRetries++;
                   await sleep(jitter);
                   continue;
                 }
 
-                // Success (or non-429 error) — forward to client
-                res.writeHead(upRes.statusCode, upRes.headers);
-                res.end(upRes.body);
+                // Non-429: stream the response directly to client
+                const isStream = (peek.headers["content-type"] || "").includes("text/event-stream");
+                if (isStream) totalStreamed++;
+
+                res.writeHead(peek.statusCode, peek.headers);
+                await pipeResponse(peek.upstreamRes, res);
                 return;
 
               } catch (err) {
-                lastErr = err;
-                log(`[ERROR] Upstream request failed: ${err.message} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+                log(`[ERROR] Upstream failed: ${err.message} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
                 if (attempt < MAX_RETRIES) {
-                  const backoff = Math.min(5000 * Math.pow(2, attempt), 60000);
-                  await sleep(backoff);
+                  await sleep(Math.min(5000 * Math.pow(2, attempt), 60000));
                   continue;
                 }
               }
@@ -470,30 +510,34 @@ jobs:
 
             // All retries exhausted
             log(`[EXHAUSTED] All ${MAX_RETRIES + 1} attempts failed for ${req.method} ${req.url}`);
-            res.writeHead(502, { "content-type": "application/json" });
-            res.end(JSON.stringify({
-              error: {
-                message: "Rate limit proxy: all retries exhausted. The upstream API may be temporarily unavailable. Please try again in a few minutes.",
-                type: "rate_limit_proxy_exhausted",
-                code: 502,
-              },
-            }));
+            if (!res.headersSent) {
+              res.writeHead(502, { "content-type": "application/json" });
+              res.end(JSON.stringify({
+                error: {
+                  message: "Rate limit proxy: all retries exhausted. Upstream API temporarily unavailable.",
+                  type: "rate_limit_proxy_exhausted",
+                  code: 502,
+                },
+              }));
+            }
           }
 
           // ── HTTP Server ───────────────────────────────
           const server = http.createServer(async (req, res) => {
             const body = await readBody(req);
 
-            // Non-completions endpoints: forward immediately without rate limiting
+            // Non-completions endpoints: forward immediately (buffered, no rate limiting)
             if (!req.url.includes("/chat/completions")) {
               try {
-                const upRes = await forwardRequest(req.method, req.url, req.headers, body);
+                const upRes = await forwardBuffered(req.method, req.url, req.headers, body);
                 res.writeHead(upRes.statusCode, upRes.headers);
                 res.end(upRes.body);
               } catch (err) {
                 log(`[ERROR] Passthrough failed: ${err.message}`);
-                res.writeHead(502, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { message: err.message } }));
+                if (!res.headersSent) {
+                  res.writeHead(502, { "content-type": "application/json" });
+                  res.end(JSON.stringify({ error: { message: err.message } }));
+                }
               }
               return;
             }
@@ -518,24 +562,18 @@ jobs:
             log(`Forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
             log(`Rate limit: ${RPM_LIMIT} req/min (sliding window)`);
             log(`Max retries on 429: ${MAX_RETRIES}`);
-            log(`Base backoff on 429: ${BASE_WAIT_MS}ms`);
+            log(`Streaming: enabled (SSE pass-through)`);
           });
 
           // ── Periodic stats ────────────────────────────
           setInterval(() => {
             pruneWindow();
-            log(`[STATS] forwarded=${totalForwarded} 429s_caught=${total429Caught} retries=${totalRetries} window=${timestamps.length}/${RPM_LIMIT} queue=${queue.length} queue_hwm=${queueHighWater}`);
+            log(`[STATS] forwarded=${totalForwarded} streamed=${totalStreamed} 429s_caught=${total429Caught} retries=${totalRetries} window=${timestamps.length}/${RPM_LIMIT} queue=${queue.length} queue_hwm=${queueHighWater}`);
           }, 120_000);
 
           // ── Graceful shutdown ─────────────────────────
-          process.on("SIGTERM", () => {
-            log("SIGTERM received, shutting down...");
-            server.close(() => process.exit(0));
-          });
-          process.on("SIGINT", () => {
-            log("SIGINT received, shutting down...");
-            server.close(() => process.exit(0));
-          });
+          process.on("SIGTERM", () => { log("SIGTERM received"); server.close(() => process.exit(0)); });
+          process.on("SIGINT", () => { log("SIGINT received"); server.close(() => process.exit(0)); });
           PROXY_EOF
 
           echo "Rate-limit proxy script created at /tmp/rate-limit-proxy.mjs"
@@ -561,9 +599,10 @@ jobs:
               exit 1
             fi
 
+            # Use head -c3 to ensure we only get the 3-digit HTTP code
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer dummykey" \
-              http://127.0.0.1:8318/v1/models 2>/dev/null || echo "000")
+              http://127.0.0.1:8318/v1/models 2>/dev/null | head -c3 || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
               echo "Rate-limit proxy is ready! (HTTP $HTTP_CODE) — proxying 8318 -> 8317"
@@ -735,10 +774,26 @@ jobs:
 
           mkdir -p "$HOME/.openclaw/workspace"
 
-          # Install clawhub - the main skill dependency
-          openclaw skills install clawhub || {
-            echo "::warning::clawhub skill install failed - continuing without it"
-          }
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          # The `openclaw skills install` CLI command changed across versions.
+          # Instead of relying on the CLI, patch the config directly to register
+          # the clawhub skill from the official NPM registry.
+          # First, try the CLI approach (may work on some versions):
+          if openclaw skills install clawhub 2>/dev/null; then
+            echo "clawhub installed via CLI"
+          else
+            echo "CLI install failed — patching config directly"
+            # Add clawhub to skills.entries in the config JSON
+            jq '
+              .skills.entries["@openclaw/clawhub"] = {
+                "enabled": true,
+                "source": "npm:@openclaw/clawhub@latest"
+              }
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" && echo "clawhub added to config" || {
+              echo "::warning::Could not add clawhub skill - continuing without it"
+            }
+          fi
 
           echo "::endgroup::"
 
@@ -830,6 +885,7 @@ jobs:
 
           ### Rate Limit Protection
           A Node.js rate-limit proxy sits between OpenClaw and CLIProxyAPI:
+          - **Streaming**: SSE/streaming responses are piped directly through with zero buffering
           - **Sliding window**: Tracks requests per minute, throttles at 55/min (below Qwen's 60/min hard cap)
           - **Auto-retry on 429**: If upstream returns 429, proxy waits 62s+ with exponential backoff and retries
           - **Transparent to OpenClaw**: OpenClaw never sees rate limit errors — requests are simply delayed
@@ -939,7 +995,7 @@ jobs:
 
               # Try to restart CLIProxyAPI
               echo "Attempting to restart CLIProxyAPI..."
-              nohup cliproxyapi -config "$AUTH_DIR/config.yaml" > /tmp/cliproxyapi.log 2>&1 &
+              nohup cliproxyapi -config "$AUTH_DIR/config.yaml" >> /tmp/cliproxyapi.log 2>&1 &
               PROXY_PID=$!
               echo "CLIProxyAPI restarted (PID: $PROXY_PID)"
               sleep 5
@@ -954,7 +1010,7 @@ jobs:
 
               # Try to restart rate-limit proxy
               echo "Attempting to restart rate-limit proxy..."
-              nohup node /tmp/rate-limit-proxy.mjs > /tmp/rate-limit-proxy.log 2>&1 &
+              nohup node /tmp/rate-limit-proxy.mjs >> /tmp/rate-limit-proxy.log 2>&1 &
               RATE_PROXY_PID=$!
               echo "Rate-limit proxy restarted (PID: $RATE_PROXY_PID)"
               sleep 3
@@ -969,7 +1025,7 @@ jobs:
 
               # Try to restart gateway
               echo "Attempting to restart gateway..."
-              nohup openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &
+              nohup openclaw gateway >> /tmp/openclaw-gateway.log 2>&1 &
               GATEWAY_PID=$!
               echo "Gateway restarted (PID: $GATEWAY_PID)"
               sleep 10
