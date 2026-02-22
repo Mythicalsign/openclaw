@@ -1,0 +1,419 @@
+name: OpenClaw Automated Onboarding
+
+on:
+  workflow_dispatch:
+    inputs:
+      encrypted_tokens:
+        description: 'Encrypted Qwen tokens (base64-encoded AES-256-CBC from Strix/Qwen.yml)'
+        required: true
+        type: string
+      decryption_password:
+        description: 'Password to decrypt the tokens'
+        required: true
+        type: string
+      discord_bot_token:
+        description: 'Discord bot token for channel configuration'
+        required: true
+        type: string
+
+jobs:
+  onboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────
+      # 1. Setup runtimes
+      # ──────────────────────────────────────────────
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      # ──────────────────────────────────────────────
+      # 2. Install OpenClaw
+      # ──────────────────────────────────────────────
+
+      - name: Install OpenClaw
+        run: |
+          set -euo pipefail
+          echo "::group::Installing OpenClaw"
+          npm install -g openclaw@latest
+          openclaw --version
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 3. Build & install CLIProxyAPI from source
+      # ──────────────────────────────────────────────
+
+      - name: Install CLIProxyAPI from source
+        run: |
+          set -euo pipefail
+          echo "::group::Building CLIProxyAPI"
+          git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git /tmp/CLIProxyAPI
+          cd /tmp/CLIProxyAPI
+          go build -o cli-proxy-api ./cmd/server
+          sudo mv cli-proxy-api /usr/local/bin/cliproxyapi
+          cd /
+          rm -rf /tmp/CLIProxyAPI
+          echo "CLIProxyAPI installed:"
+          cliproxyapi --help || true
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 4. Decrypt tokens and set up CLIProxyAPI
+      # ──────────────────────────────────────────────
+
+      - name: Decrypt Qwen tokens
+        env:
+          ENCRYPTED_TOKENS: ${{ github.event.inputs.encrypted_tokens }}
+          DECRYPTION_PASSWORD: ${{ github.event.inputs.decryption_password }}
+        run: |
+          set -euo pipefail
+          echo "::group::Decrypting Qwen tokens"
+
+          AUTH_DIR="$HOME/.cli-proxy-api"
+          mkdir -p "$AUTH_DIR"
+          chmod 700 "$AUTH_DIR"
+
+          TEMP_DIR=$(mktemp -d)
+          cd "$TEMP_DIR"
+
+          # Decode base64
+          echo "$ENCRYPTED_TOKENS" | base64 -d > qwen-tokens.enc
+
+          # Decrypt with AES-256-CBC (same scheme as Strix/Qwen.yml)
+          openssl enc -aes-256-cbc -d -salt -pbkdf2 \
+            -in qwen-tokens.enc \
+            -out qwen-tokens.tar.gz \
+            -pass pass:"$DECRYPTION_PASSWORD"
+
+          # Extract token files into auth directory
+          tar -xzf qwen-tokens.tar.gz -C "$AUTH_DIR"
+
+          TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
+          echo "Decrypted $TOKEN_COUNT Qwen token file(s)"
+
+          if [ "$TOKEN_COUNT" -eq 0 ]; then
+            echo "::error::No Qwen token files found after decryption!"
+            echo "Verify the encrypted_tokens input and decryption_password are correct."
+            rm -rf "$TEMP_DIR"
+            exit 1
+          fi
+
+          echo "Token files:"
+          ls -la "$AUTH_DIR"/qwen-*.json
+
+          # Cleanup temp files
+          rm -rf "$TEMP_DIR"
+
+          echo "AUTH_DIR=$AUTH_DIR" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+
+      - name: Create CLIProxyAPI config
+        run: |
+          set -euo pipefail
+          echo "::group::Creating CLIProxyAPI config"
+
+          cat > "$AUTH_DIR/config.yaml" <<CFGEOF
+          port: 8317
+          host: "127.0.0.1"
+          auth-dir: "$AUTH_DIR"
+          debug: false
+          logging-to-file: true
+          api-keys:
+            - "dummykey"
+          routing:
+            strategy: "round-robin"
+          request-retry: 3
+          CFGEOF
+
+          # Fix indentation (remove leading whitespace from heredoc)
+          sed -i 's/^          //' "$AUTH_DIR/config.yaml"
+
+          echo "CLIProxyAPI config:"
+          cat "$AUTH_DIR/config.yaml"
+          echo "::endgroup::"
+
+      - name: Start CLIProxyAPI
+        run: |
+          set -euo pipefail
+          echo "::group::Starting CLIProxyAPI"
+
+          # Start CLIProxyAPI in background
+          nohup cliproxyapi -config "$AUTH_DIR/config.yaml" > /tmp/cliproxyapi.log 2>&1 &
+          PROXY_PID=$!
+          echo "CLIProxyAPI started (PID: $PROXY_PID)"
+          echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
+
+          # Wait for the proxy to be ready
+          echo "Waiting for CLIProxyAPI to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8317/v1/models > /dev/null 2>&1; then
+              echo "CLIProxyAPI is ready!"
+              break
+            fi
+            if ! kill -0 $PROXY_PID 2>/dev/null; then
+              echo "::error::CLIProxyAPI process died unexpectedly"
+              cat /tmp/cliproxyapi.log || true
+              exit 1
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::warning::CLIProxyAPI didn't respond to health check within 30 seconds"
+              echo "Logs:"
+              cat /tmp/cliproxyapi.log || true
+              # Continue anyway - the non-interactive onboard uses --custom-compatibility openai
+              # so it won't probe the endpoint
+            fi
+            sleep 1
+          done
+
+          # Show available models
+          echo ""
+          echo "Available models:"
+          curl -s http://127.0.0.1:8317/v1/models 2>/dev/null | jq '.data[].id' 2>/dev/null || echo "(could not list models)"
+
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 5. Run OpenClaw non-interactive onboarding
+      # ──────────────────────────────────────────────
+
+      - name: Run OpenClaw onboarding (non-interactive)
+        run: |
+          set -euo pipefail
+          echo "::group::Running OpenClaw onboarding"
+
+          openclaw onboard --non-interactive --accept-risk \
+            --flow quickstart \
+            --auth-choice custom-api-key \
+            --custom-base-url "http://127.0.0.1:8317/v1" \
+            --custom-api-key "dummykey" \
+            --custom-model-id "qwen3-coder-plus" \
+            --custom-compatibility openai \
+            --install-daemon \
+            --skip-channels \
+            --skip-skills \
+            --skip-health \
+            --skip-ui
+
+          echo "Non-interactive onboarding completed"
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 6. Patch config for Discord, Skills, Hooks
+      # ──────────────────────────────────────────────
+
+      - name: Patch OpenClaw config for Discord
+        env:
+          DISCORD_BOT_TOKEN: ${{ github.event.inputs.discord_bot_token }}
+        run: |
+          set -euo pipefail
+          echo "::group::Patching OpenClaw config for Discord"
+
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::OpenClaw config file not found at $CONFIG_FILE"
+            echo "Non-interactive onboarding may have failed."
+            exit 1
+          fi
+
+          echo "Current config (before patching):"
+          jq '.' "$CONFIG_FILE"
+
+          # Patch Discord configuration
+          # - enabled: true
+          # - token: from workflow input
+          # - groupPolicy: "open" (allow all channels)
+          jq --arg token "$DISCORD_BOT_TOKEN" '
+            .channels = (.channels // {}) |
+            .channels.discord = {
+              "enabled": true,
+              "token": $token,
+              "groupPolicy": "open",
+              "guilds": {}
+            }
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+          echo "Discord configuration patched"
+          echo "::endgroup::"
+
+      - name: Patch OpenClaw config for Skills
+        run: |
+          set -euo pipefail
+          echo "::group::Patching OpenClaw config for Skills"
+
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          # Patch skills configuration
+          # - nodeManager: npm
+          # - skip all API key prompts (none set)
+          jq '
+            .skills = (.skills // {}) |
+            .skills.install = {
+              "nodeManager": "npm"
+            } |
+            .skills.entries = (.skills.entries // {})
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+          echo "Skills configuration patched"
+          echo "::endgroup::"
+
+      - name: Patch OpenClaw config for Hooks
+        run: |
+          set -euo pipefail
+          echo "::group::Patching OpenClaw config for Hooks"
+
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          # Hooks: skip for now (as per user's manual onboarding)
+          jq '
+            .hooks = (.hooks // {}) |
+            .hooks.internal = {
+              "enabled": false,
+              "entries": {}
+            }
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+          echo "Hooks configuration patched (skipped)"
+          echo "::endgroup::"
+
+      - name: Install clawhub skill
+        run: |
+          set -euo pipefail
+          echo "::group::Installing clawhub skill"
+
+          # Ensure workspace exists
+          mkdir -p "$HOME/.openclaw/workspace"
+
+          # Install clawhub - this is the main skill dependency
+          openclaw skills install clawhub --node-manager npm || {
+            echo "::warning::clawhub skill install failed - this may be expected in CI"
+            echo "The skill can be installed manually later"
+          }
+
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
+      # 7. Verify and display final configuration
+      # ──────────────────────────────────────────────
+
+      - name: Verify final configuration
+        run: |
+          set -euo pipefail
+          echo "::group::Final configuration"
+
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          echo "=== Final OpenClaw Config ==="
+          # Redact sensitive values
+          jq '
+            if .channels?.discord?.token then
+              .channels.discord.token = "***REDACTED***"
+            else . end |
+            if .models?.providers then
+              .models.providers |= with_entries(
+                if .value.apiKey then
+                  .value.apiKey = "***REDACTED***"
+                else . end
+              )
+            else . end |
+            if .gateway?.auth?.token then
+              .gateway.auth.token = "***REDACTED***"
+            else . end
+          ' "$CONFIG_FILE"
+
+          echo ""
+          echo "=== CLIProxyAPI Status ==="
+          if kill -0 $PROXY_PID 2>/dev/null; then
+            echo "CLIProxyAPI is running (PID: $PROXY_PID)"
+            TOKEN_COUNT=$(find "$AUTH_DIR" -maxdepth 1 -name 'qwen-*.json' 2>/dev/null | wc -l)
+            echo "Qwen tokens loaded: $TOKEN_COUNT"
+            echo "API endpoint: http://127.0.0.1:8317/v1"
+            echo "Routing strategy: round-robin"
+          else
+            echo "::warning::CLIProxyAPI is not running"
+          fi
+
+          echo ""
+          echo "=== OpenClaw Gateway ==="
+          # Try to check gateway status
+          openclaw health --timeout 5000 2>/dev/null || echo "Gateway health check: skipped or unavailable"
+
+          echo ""
+          echo "=== Configuration Summary ==="
+          echo "LLM Provider: Custom (CLIProxyAPI -> Qwen)"
+          echo "Model: qwen3-coder-plus"
+          echo "API Base: http://127.0.0.1:8317/v1"
+          echo "Channel: Discord (Open access)"
+          echo "Skills: clawhub (npm)"
+          echo "Hooks: Skipped"
+
+          echo "::endgroup::"
+
+      - name: Show summary
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ## OpenClaw Onboarding Complete
+
+          ### Configuration
+          | Setting | Value |
+          |---------|-------|
+          | LLM Provider | Custom (CLIProxyAPI -> Qwen Code) |
+          | Model | `qwen3-coder-plus` |
+          | API Endpoint | `http://127.0.0.1:8317/v1` |
+          | Routing | Round-robin across all Qwen tokens |
+          | Channel | Discord (Open access - all channels) |
+          | Skills | clawhub (npm) |
+          | Hooks | Skipped |
+          | Gateway | Local (port 18789, loopback, token auth) |
+
+          ### How It Works
+          1. **CLIProxyAPI** decrypts your Qwen tokens and provides an OpenAI-compatible API
+          2. **OpenClaw** connects to CLIProxyAPI as a "custom provider"
+          3. **Discord** bot is configured with open channel access
+          4. **Round-robin** load balancing distributes requests across all Qwen accounts
+
+          ### Encryption
+          - Algorithm: AES-256-CBC with PBKDF2 (via openssl)
+          - Tokens are base64-encoded after encryption
+          - Same scheme as the Strix/Qwen.yml token collection workflow
+
+          ### Next Steps
+          - Monitor the gateway: `openclaw dashboard`
+          - Check health: `openclaw health`
+          - Configure more channels: `openclaw channels add`
+          - Add skills: `openclaw skills install <name>`
+          - Enable hooks: `openclaw hooks enable <name>`
+          EOF
+
+      # ──────────────────────────────────────────────
+      # 8. Cleanup
+      # ──────────────────────────────────────────────
+
+      - name: Cleanup sensitive data
+        if: always()
+        run: |
+          # Kill CLIProxyAPI
+          kill $PROXY_PID 2>/dev/null || true
+
+          # Remove token files
+          rm -f "$AUTH_DIR"/qwen-*.json 2>/dev/null || true
+          rm -f /tmp/cliproxyapi.log 2>/dev/null || true
+
+          echo "Sensitive data cleaned up"
