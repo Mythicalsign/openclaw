@@ -296,16 +296,20 @@ jobs:
           const WINDOW_MS = 60_000;        // 1-minute sliding window
           const MAX_QUEUE = 200;           // max queued requests
           const MAX_RETRIES = 10;          // max retries on 429
-          const BASE_WAIT_MS = 62_000;     // base wait on 429 (just over 1 min)
-          const MAX_WAIT_MS = 180_000;     // max wait between retries (3 min)
+          const BASE_WAIT_MS = 5_000;      // 5s base wait on 429 (was 62s — too aggressive)
+          const MAX_WAIT_MS = 65_000;      // max wait between retries (~1 min, was 3 min)
           const UPSTREAM_TIMEOUT = 300_000; // 5 min timeout for LLM responses
+          const BODY_READ_TIMEOUT = 30_000; // 30s max to read incoming request body
+          const THROTTLE_CHECK_INTERVAL = 500; // check client alive every 500ms while throttling
 
           // ── State ─────────────────────────────────────
-          const timestamps = [];           // sliding window of request timestamps
+          const timestamps = [];           // sliding window of SUCCESSFUL request timestamps
           let totalForwarded = 0;
           let total429Caught = 0;
           let totalRetries = 0;
           let totalStreamed = 0;
+          let totalClientAborts = 0;
+          let totalQueueSkips = 0;
           let queueHighWater = 0;
 
           // ── Sliding-window rate limiter ────────────────
@@ -320,15 +324,27 @@ jobs:
             timestamps.push(Date.now());
           }
 
+          // Remove the most recent timestamp (undo a recordRequest after a 429)
+          function unrecordRequest() {
+            if (timestamps.length > 0) {
+              timestamps.pop();
+            }
+          }
+
           function msUntilSlotFrees() {
             pruneWindow();
             if (timestamps.length < RPM_LIMIT) return 0;
             return Math.max(0, timestamps[0] + WINDOW_MS - Date.now() + 50);
           }
 
-          // ── Serial queue ──────────────────────────────
+          // ── Concurrent-safe queue (NOT serial) ─────────
+          // Previous implementation used a strict serial queue which meant
+          // one slow/stuck request blocked everything. Now we use a
+          // concurrency-limited approach: up to 3 concurrent requests to
+          // upstream, with rate-limit gating on each.
+          const CONCURRENCY = 3;
           const queue = [];
-          let processing = false;
+          let activeCount = 0;
 
           function enqueue(task) {
             if (queue.length >= MAX_QUEUE) return false;
@@ -339,13 +355,18 @@ jobs:
           }
 
           async function drainQueue() {
-            if (processing || queue.length === 0) return;
-            processing = true;
-            while (queue.length > 0) {
+            while (queue.length > 0 && activeCount < CONCURRENCY) {
               const task = queue.shift();
-              try { await task(); } catch (e) { log(`[ERROR] Task failed: ${e.message}`); }
+              activeCount++;
+              // Fire and forget — each task manages its own lifecycle
+              task().catch((e) => {
+                log(`[ERROR] Task failed: ${e.message}`);
+              }).finally(() => {
+                activeCount--;
+                // Kick the queue again after task completes
+                drainQueue();
+              });
             }
-            processing = false;
           }
 
           // ── Helpers ───────────────────────────────────
@@ -357,19 +378,54 @@ jobs:
             return new Promise((r) => setTimeout(r, ms));
           }
 
-          function readBody(stream) {
+          // Abortable sleep: resolves after ms, or rejects if signal is aborted
+          function abortableSleep(ms, signal) {
             return new Promise((resolve, reject) => {
-              const chunks = [];
-              stream.on("data", (c) => chunks.push(c));
-              stream.on("end", () => resolve(Buffer.concat(chunks)));
-              stream.on("error", reject);
+              if (signal?.aborted) { reject(new Error("aborted")); return; }
+              const timer = setTimeout(resolve, ms);
+              const onAbort = () => { clearTimeout(timer); reject(new Error("aborted")); };
+              signal?.addEventListener("abort", onAbort, { once: true });
             });
           }
 
-          // ── Peek request: read ONLY status + headers, buffer first chunk ──
-          // Returns { statusCode, headers, firstChunk, upstreamRes } so we can
-          // decide whether to retry (429) or stream through. Does NOT consume
-          // the full body.
+          // Read body with timeout and abort handling
+          function readBody(stream, timeoutMs = BODY_READ_TIMEOUT) {
+            return new Promise((resolve, reject) => {
+              const chunks = [];
+              let done = false;
+              const finish = (err, result) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                stream.removeListener("data", onData);
+                stream.removeListener("end", onEnd);
+                stream.removeListener("error", onError);
+                stream.removeListener("close", onClose);
+                if (err) reject(err); else resolve(result);
+              };
+              const timer = setTimeout(() => {
+                finish(new Error("request body read timeout"));
+              }, timeoutMs);
+              const onData = (c) => chunks.push(c);
+              const onEnd = () => finish(null, Buffer.concat(chunks));
+              const onError = (e) => finish(e);
+              const onClose = () => {
+                // Client closed connection before sending full body
+                if (!done) finish(new Error("client closed connection during body read"));
+              };
+              stream.on("data", onData);
+              stream.on("end", onEnd);
+              stream.on("error", onError);
+              stream.on("close", onClose);
+            });
+          }
+
+          // Check if client response is still writable
+          function isClientAlive(res) {
+            return !res.destroyed && !res.writableEnded && !res.writableFinished;
+          }
+
+          // ── Peek request: read ONLY status + headers ──
           function peekUpstream(method, url, headers, body) {
             return new Promise((resolve, reject) => {
               const opts = {
@@ -382,9 +438,7 @@ jobs:
               };
 
               const upstream = http.request(opts, (upRes) => {
-                // Pause the stream until we decide what to do
                 upRes.pause();
-
                 resolve({
                   statusCode: upRes.statusCode,
                   headers: upRes.headers,
@@ -405,27 +459,40 @@ jobs:
           // ── Drain and discard an upstream response (for 429 retries) ──
           function discardResponse(upstreamRes) {
             return new Promise((resolve) => {
+              if (upstreamRes.destroyed) { resolve(); return; }
               upstreamRes.resume();
               upstreamRes.on("end", resolve);
-              upstreamRes.on("error", resolve); // ignore errors during discard
+              upstreamRes.on("error", resolve);
+              // Safety: force-resolve after 5s if the response hangs
+              setTimeout(() => {
+                if (!upstreamRes.destroyed) upstreamRes.destroy();
+                resolve();
+              }, 5000);
             });
           }
 
           // ── Pipe upstream response to client (streaming) ──────────
           function pipeResponse(upstreamRes, res) {
             return new Promise((resolve, reject) => {
-              upstreamRes.resume();
-              upstreamRes.pipe(res);
-              upstreamRes.on("end", resolve);
-              upstreamRes.on("error", (err) => {
-                res.destroy(err);
-                reject(err);
-              });
-              res.on("close", () => {
-                // Client disconnected early — destroy upstream to free resources
+              if (!isClientAlive(res)) {
+                // Client already gone — discard upstream
                 if (!upstreamRes.destroyed) upstreamRes.destroy();
                 resolve();
-              });
+                return;
+              }
+              upstreamRes.resume();
+              upstreamRes.pipe(res);
+              let settled = false;
+              const settle = (err) => {
+                if (settled) return;
+                settled = true;
+                if (!upstreamRes.destroyed) upstreamRes.destroy();
+                if (err) reject(err); else resolve();
+              };
+              upstreamRes.on("end", () => settle());
+              upstreamRes.on("error", (err) => settle(err));
+              res.on("close", () => settle());
+              res.on("error", () => settle());
             });
           }
 
@@ -459,82 +526,186 @@ jobs:
           }
 
           // ── Handle a single proxied completions request ───────────
-          // Strategy: peek at the status code first. If 429, discard the
-          // response, backoff, and retry. If 200, pipe the full response
-          // (including SSE stream) directly to the client with zero buffering.
+          //
+          // FIXES vs previous version:
+          // 1. Client-abort detection: checks if client is still connected
+          //    at every wait point. Abandons zombie requests immediately.
+          // 2. Sliding window NOT polluted by 429s: unrecordRequest() on 429
+          //    so failed attempts don't eat rate-limit slots.
+          // 3. Reduced backoff: 5s base (was 62s) to avoid OpenClaw timeout.
+          // 4. Concurrency: no longer strictly serial — up to 3 concurrent
+          //    requests so one slow retry doesn't block everything.
+          // 5. AbortController: each request gets a signal tied to client
+          //    disconnect, used to cancel sleeps immediately.
+          //
           async function handleRequest(req, res, body) {
-            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-              // Wait for a rate-limit slot
-              let waitMs = msUntilSlotFrees();
-              while (waitMs > 0) {
-                log(`[THROTTLE] Waiting ${(waitMs / 1000).toFixed(1)}s for rate window (attempt ${attempt + 1}/${MAX_RETRIES + 1}, queue=${queue.length})`);
-                await sleep(waitMs);
-                waitMs = msUntilSlotFrees();
-              }
+            // Create abort controller tied to client disconnect
+            const ac = new AbortController();
+            const onClose = () => { ac.abort(); };
+            res.on("close", onClose);
 
-              recordRequest();
-              totalForwarded++;
-
-              try {
-                const peek = await peekUpstream(req.method, req.url, req.headers, body);
-
-                if (peek.statusCode === 429) {
-                  total429Caught++;
-                  // Discard the 429 response body before retrying
-                  await discardResponse(peek.upstreamRes);
-
-                  const backoff = Math.min(BASE_WAIT_MS * Math.pow(1.5, attempt), MAX_WAIT_MS);
-                  const jitter = backoff * (0.9 + Math.random() * 0.2);
-                  log(`[429 CAUGHT] Upstream 429 (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Backoff ${(jitter / 1000).toFixed(1)}s`);
-                  totalRetries++;
-                  await sleep(jitter);
-                  continue;
+            try {
+              for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+                // ── Check client is still alive ──
+                if (!isClientAlive(res)) {
+                  totalClientAborts++;
+                  log(`[ABORT] Client disconnected before attempt ${attempt + 1} for ${req.method} ${req.url}`);
+                  return;
                 }
 
-                // Non-429: stream the response directly to client
-                const isStream = (peek.headers["content-type"] || "").includes("text/event-stream");
-                if (isStream) totalStreamed++;
+                // ── Wait for a rate-limit slot (with client-alive checks) ──
+                let waitMs = msUntilSlotFrees();
+                while (waitMs > 0) {
+                  if (!isClientAlive(res)) {
+                    totalClientAborts++;
+                    log(`[ABORT] Client disconnected while throttling for ${req.method} ${req.url}`);
+                    return;
+                  }
+                  const sleepTime = Math.min(waitMs, THROTTLE_CHECK_INTERVAL);
+                  log(`[THROTTLE] Waiting ${(waitMs / 1000).toFixed(1)}s for rate window (attempt ${attempt + 1}/${MAX_RETRIES + 1}, queue=${queue.length}, active=${activeCount})`);
+                  try {
+                    await abortableSleep(sleepTime, ac.signal);
+                  } catch (e) {
+                    // Client aborted during sleep
+                    totalClientAborts++;
+                    log(`[ABORT] Client disconnected during throttle sleep for ${req.method} ${req.url}`);
+                    return;
+                  }
+                  waitMs = msUntilSlotFrees();
+                }
 
-                res.writeHead(peek.statusCode, peek.headers);
-                await pipeResponse(peek.upstreamRes, res);
-                return;
+                recordRequest();
+                totalForwarded++;
 
-              } catch (err) {
-                log(`[ERROR] Upstream failed: ${err.message} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
-                if (attempt < MAX_RETRIES) {
-                  await sleep(Math.min(5000 * Math.pow(2, attempt), 60000));
-                  continue;
+                try {
+                  const peek = await peekUpstream(req.method, req.url, req.headers, body);
+
+                  if (peek.statusCode === 429) {
+                    total429Caught++;
+                    // CRITICAL FIX: un-record this request from the sliding window.
+                    // A 429 means the request didn't actually consume a real slot —
+                    // keeping it in the window causes cascading over-throttling.
+                    unrecordRequest();
+
+                    await discardResponse(peek.upstreamRes);
+
+                    // Parse Retry-After header if present (some APIs send it)
+                    let retryAfterMs = 0;
+                    const retryAfterHeader = peek.headers["retry-after"];
+                    if (retryAfterHeader) {
+                      const parsed = parseInt(retryAfterHeader, 10);
+                      if (!isNaN(parsed)) retryAfterMs = parsed * 1000;
+                    }
+
+                    // Use Retry-After if available, otherwise use exponential backoff
+                    const backoff = retryAfterMs > 0
+                      ? Math.min(retryAfterMs, MAX_WAIT_MS)
+                      : Math.min(BASE_WAIT_MS * Math.pow(2, attempt), MAX_WAIT_MS);
+                    const jitter = backoff * (0.8 + Math.random() * 0.4);
+
+                    log(`[429 CAUGHT] Upstream 429 (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Backoff ${(jitter / 1000).toFixed(1)}s${retryAfterMs > 0 ? " (from Retry-After header)" : ""}`);
+                    totalRetries++;
+
+                    // Check client alive before waiting
+                    if (!isClientAlive(res)) {
+                      totalClientAborts++;
+                      log(`[ABORT] Client disconnected before 429 backoff for ${req.method} ${req.url}`);
+                      return;
+                    }
+
+                    try {
+                      await abortableSleep(jitter, ac.signal);
+                    } catch (e) {
+                      totalClientAborts++;
+                      log(`[ABORT] Client disconnected during 429 backoff for ${req.method} ${req.url}`);
+                      return;
+                    }
+                    continue;
+                  }
+
+                  // Non-429: stream the response directly to client
+                  if (!isClientAlive(res)) {
+                    totalClientAborts++;
+                    log(`[ABORT] Client gone before streaming response for ${req.method} ${req.url}`);
+                    await discardResponse(peek.upstreamRes);
+                    return;
+                  }
+
+                  const isStream = (peek.headers["content-type"] || "").includes("text/event-stream");
+                  if (isStream) totalStreamed++;
+
+                  if (!res.headersSent) {
+                    res.writeHead(peek.statusCode, peek.headers);
+                  }
+                  await pipeResponse(peek.upstreamRes, res);
+                  return;
+
+                } catch (err) {
+                  log(`[ERROR] Upstream error: ${err.message} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+                  // Also un-record on errors — the request didn't succeed
+                  unrecordRequest();
+
+                  if (!isClientAlive(res)) {
+                    totalClientAborts++;
+                    log(`[ABORT] Client disconnected after upstream error for ${req.method} ${req.url}`);
+                    return;
+                  }
+
+                  if (attempt < MAX_RETRIES) {
+                    const errBackoff = Math.min(3000 * Math.pow(1.5, attempt), 30000);
+                    try {
+                      await abortableSleep(errBackoff, ac.signal);
+                    } catch (e) {
+                      totalClientAborts++;
+                      return;
+                    }
+                    continue;
+                  }
                 }
               }
-            }
 
-            // All retries exhausted
-            log(`[EXHAUSTED] All ${MAX_RETRIES + 1} attempts failed for ${req.method} ${req.url}`);
-            if (!res.headersSent) {
-              res.writeHead(502, { "content-type": "application/json" });
-              res.end(JSON.stringify({
-                error: {
-                  message: "Rate limit proxy: all retries exhausted. Upstream API temporarily unavailable.",
-                  type: "rate_limit_proxy_exhausted",
-                  code: 502,
-                },
-              }));
+              // All retries exhausted
+              log(`[EXHAUSTED] All ${MAX_RETRIES + 1} attempts failed for ${req.method} ${req.url}`);
+              if (!res.headersSent && isClientAlive(res)) {
+                res.writeHead(502, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                  error: {
+                    message: "Rate limit proxy: all retries exhausted. Upstream API temporarily unavailable.",
+                    type: "rate_limit_proxy_exhausted",
+                    code: 502,
+                  },
+                }));
+              }
+            } finally {
+              res.removeListener("close", onClose);
             }
           }
 
           // ── HTTP Server ───────────────────────────────
           const server = http.createServer(async (req, res) => {
-            const body = await readBody(req);
+            let body;
+            try {
+              body = await readBody(req);
+            } catch (err) {
+              log(`[ERROR] Failed to read request body: ${err.message}`);
+              if (!res.headersSent && isClientAlive(res)) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: `Failed to read request body: ${err.message}` } }));
+              }
+              return;
+            }
 
             // Non-completions endpoints: forward immediately (buffered, no rate limiting)
             if (!req.url.includes("/chat/completions")) {
               try {
                 const upRes = await forwardBuffered(req.method, req.url, req.headers, body);
-                res.writeHead(upRes.statusCode, upRes.headers);
-                res.end(upRes.body);
+                if (isClientAlive(res)) {
+                  res.writeHead(upRes.statusCode, upRes.headers);
+                  res.end(upRes.body);
+                }
               } catch (err) {
                 log(`[ERROR] Passthrough failed: ${err.message}`);
-                if (!res.headersSent) {
+                if (!res.headersSent && isClientAlive(res)) {
                   res.writeHead(502, { "content-type": "application/json" });
                   res.end(JSON.stringify({ error: { message: err.message } }));
                 }
@@ -546,14 +717,23 @@ jobs:
             const ok = enqueue(() => handleRequest(req, res, body));
             if (!ok) {
               log(`[QUEUE FULL] Rejecting request (queue=${MAX_QUEUE})`);
-              res.writeHead(503, { "content-type": "application/json" });
-              res.end(JSON.stringify({
-                error: {
-                  message: "Rate limit proxy: queue full. Too many concurrent requests.",
-                  type: "rate_limit_proxy_queue_full",
-                  code: 503,
-                },
-              }));
+              if (isClientAlive(res)) {
+                res.writeHead(503, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                  error: {
+                    message: "Rate limit proxy: queue full. Too many concurrent requests.",
+                    type: "rate_limit_proxy_queue_full",
+                    code: 503,
+                  },
+                }));
+              }
+            }
+          });
+
+          // Prevent server from crashing on connection errors
+          server.on("clientError", (err, socket) => {
+            if (socket.writable) {
+              socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
             }
           });
 
@@ -562,18 +742,38 @@ jobs:
             log(`Forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
             log(`Rate limit: ${RPM_LIMIT} req/min (sliding window)`);
             log(`Max retries on 429: ${MAX_RETRIES}`);
+            log(`Concurrency: ${CONCURRENCY} simultaneous upstream requests`);
             log(`Streaming: enabled (SSE pass-through)`);
+            log(`Client-abort detection: enabled`);
           });
 
           // ── Periodic stats ────────────────────────────
           setInterval(() => {
             pruneWindow();
-            log(`[STATS] forwarded=${totalForwarded} streamed=${totalStreamed} 429s_caught=${total429Caught} retries=${totalRetries} window=${timestamps.length}/${RPM_LIMIT} queue=${queue.length} queue_hwm=${queueHighWater}`);
-          }, 120_000);
+            log(`[STATS] forwarded=${totalForwarded} streamed=${totalStreamed} 429s=${total429Caught} retries=${totalRetries} aborts=${totalClientAborts} skips=${totalQueueSkips} window=${timestamps.length}/${RPM_LIMIT} queue=${queue.length} active=${activeCount} hwm=${queueHighWater}`);
+          }, 60_000);
+
+          // ── Queue health watchdog ─────────────────────
+          // If the queue grows but nothing is processing, force-drain
+          setInterval(() => {
+            if (queue.length > 0 && activeCount < CONCURRENCY) {
+              log(`[WATCHDOG] Queue has ${queue.length} items but only ${activeCount}/${CONCURRENCY} active — force-draining`);
+              drainQueue();
+            }
+          }, 10_000);
 
           // ── Graceful shutdown ─────────────────────────
           process.on("SIGTERM", () => { log("SIGTERM received"); server.close(() => process.exit(0)); });
           process.on("SIGINT", () => { log("SIGINT received"); server.close(() => process.exit(0)); });
+
+          // Catch unhandled rejections to prevent proxy crash
+          process.on("unhandledRejection", (reason) => {
+            log(`[UNHANDLED REJECTION] ${reason}`);
+          });
+          process.on("uncaughtException", (err) => {
+            log(`[UNCAUGHT EXCEPTION] ${err.message}\n${err.stack}`);
+            // Don't exit — keep serving
+          });
           PROXY_EOF
 
           echo "Rate-limit proxy script created at /tmp/rate-limit-proxy.mjs"
