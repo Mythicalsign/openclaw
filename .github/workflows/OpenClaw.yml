@@ -67,6 +67,26 @@ jobs:
           echo "OpenClaw version: $(openclaw --version)"
           echo "::endgroup::"
 
+      - name: Fix OpenClaw extension permissions
+        run: |
+          set -euo pipefail
+          echo "::group::Fixing extension permissions"
+
+          # npm global installs on GitHub Actions have 777 permissions on the
+          # extensions directory. OpenClaw's gateway blocks "world-writable"
+          # plugin paths for security reasons. Fix by removing the world-writable bit.
+          OPENCLAW_DIR=$(npm root -g)/openclaw
+          if [ -d "$OPENCLAW_DIR/extensions" ]; then
+            echo "Fixing permissions on $OPENCLAW_DIR/extensions"
+            chmod -R o-w "$OPENCLAW_DIR/extensions"
+            echo "Permissions fixed. Sample:"
+            ls -la "$OPENCLAW_DIR/extensions/" | head -10
+          else
+            echo "::warning::OpenClaw extensions directory not found at $OPENCLAW_DIR/extensions"
+          fi
+
+          echo "::endgroup::"
+
       # ──────────────────────────────────────────────
       # 3. Build & install CLIProxyAPI from source
       # ──────────────────────────────────────────────
