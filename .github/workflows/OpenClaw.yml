@@ -210,7 +210,7 @@ jobs:
             - "dummykey"
           routing:
             strategy: "round-robin"
-          request-retry: 3
+          request-retry: 1
           EOF
 
           # Fix indentation (remove leading whitespace from heredoc)
@@ -274,7 +274,329 @@ jobs:
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
+      # 4.5. Start rate-limit-aware proxy (sits between
+      #      OpenClaw on port 8318 and CLIProxyAPI on 8317)
+      #
+      #      FIXES: Qwen 60 req/min rate limit causing
+      #      permanent "API rate limit reached" errors.
+      #      The proxy transparently queues, waits, and
+      #      retries so OpenClaw never sees a 429.
+      # ──────────────────────────────────────────────
+
+      - name: Create rate-limit proxy
+        run: |
+          set -euo pipefail
+          echo "::group::Creating rate-limit proxy"
+
+          cat > /tmp/rate-limit-proxy.mjs << 'PROXY_EOF'
+          import http from "node:http";
+
+          // ── Configuration ─────────────────────────────
+          const LISTEN_PORT = 8318;
+          const UPSTREAM_HOST = "127.0.0.1";
+          const UPSTREAM_PORT = 8317;
+          const RPM_LIMIT = 55;            // stay under the 60/min hard cap
+          const WINDOW_MS = 60_000;        // 1-minute sliding window
+          const MAX_QUEUE = 200;           // max queued requests
+          const MAX_RETRIES = 10;          // max retries on 429
+          const BASE_WAIT_MS = 62_000;     // base wait on 429 (just over 1 min)
+          const MAX_WAIT_MS = 180_000;     // max wait between retries (3 min)
+          const UPSTREAM_TIMEOUT = 300_000; // 5 min timeout for LLM responses
+
+          // ── State ─────────────────────────────────────
+          const timestamps = [];           // sliding window of request timestamps
+          let totalForwarded = 0;
+          let total429Caught = 0;
+          let totalRetries = 0;
+          let queueHighWater = 0;
+
+          // ── Sliding-window rate limiter ────────────────
+          function pruneWindow() {
+            const cutoff = Date.now() - WINDOW_MS;
+            while (timestamps.length > 0 && timestamps[0] < cutoff) {
+              timestamps.shift();
+            }
+          }
+
+          function canSendNow() {
+            pruneWindow();
+            return timestamps.length < RPM_LIMIT;
+          }
+
+          function recordRequest() {
+            timestamps.push(Date.now());
+          }
+
+          function msUntilSlotFrees() {
+            pruneWindow();
+            if (timestamps.length < RPM_LIMIT) return 0;
+            return Math.max(0, timestamps[0] + WINDOW_MS - Date.now() + 50);
+          }
+
+          // ── Serial queue ──────────────────────────────
+          // Ensures only one request at a time goes upstream so the sliding
+          // window is always accurate, while the LLM is generating.
+          const queue = [];
+          let processing = false;
+
+          function enqueue(task) {
+            if (queue.length >= MAX_QUEUE) {
+              return false;
+            }
+            queue.push(task);
+            if (queue.length > queueHighWater) queueHighWater = queue.length;
+            drainQueue();
+            return true;
+          }
+
+          async function drainQueue() {
+            if (processing || queue.length === 0) return;
+            processing = true;
+            while (queue.length > 0) {
+              const task = queue.shift();
+              try {
+                await task();
+              } catch (e) {
+                log(`[ERROR] Task failed: ${e.message}`);
+              }
+            }
+            processing = false;
+          }
+
+          // ── Helpers ───────────────────────────────────
+          function log(msg) {
+            const ts = new Date().toISOString();
+            console.log(`${ts} [rate-limit-proxy] ${msg}`);
+          }
+
+          function sleep(ms) {
+            return new Promise((r) => setTimeout(r, ms));
+          }
+
+          // ── Read full body from IncomingMessage ───────
+          function readBody(stream) {
+            return new Promise((resolve, reject) => {
+              const chunks = [];
+              stream.on("data", (c) => chunks.push(c));
+              stream.on("end", () => resolve(Buffer.concat(chunks)));
+              stream.on("error", reject);
+            });
+          }
+
+          // ── Forward one request to upstream ───────────
+          function forwardRequest(method, url, headers, body) {
+            return new Promise((resolve, reject) => {
+              const opts = {
+                hostname: UPSTREAM_HOST,
+                port: UPSTREAM_PORT,
+                path: url,
+                method,
+                headers: { ...headers, host: `${UPSTREAM_HOST}:${UPSTREAM_PORT}` },
+                timeout: UPSTREAM_TIMEOUT,
+              };
+
+              const upstream = http.request(opts, (upRes) => {
+                const chunks = [];
+                upRes.on("data", (c) => chunks.push(c));
+                upRes.on("end", () => {
+                  resolve({
+                    statusCode: upRes.statusCode,
+                    headers: upRes.headers,
+                    body: Buffer.concat(chunks),
+                  });
+                });
+                upRes.on("error", reject);
+              });
+
+              upstream.on("timeout", () => {
+                upstream.destroy(new Error("upstream timeout"));
+              });
+              upstream.on("error", reject);
+
+              if (body && body.length > 0) {
+                upstream.write(body);
+              }
+              upstream.end();
+            });
+          }
+
+          // ── Handle a single proxied request ───────────
+          async function handleRequest(req, res, body) {
+            let lastErr = null;
+
+            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+              // Wait for a slot in the sliding window
+              let waitMs = msUntilSlotFrees();
+              while (waitMs > 0) {
+                log(`[THROTTLE] Waiting ${(waitMs / 1000).toFixed(1)}s for rate window to clear (attempt ${attempt + 1}/${MAX_RETRIES + 1}, queue=${queue.length})`);
+                await sleep(waitMs);
+                waitMs = msUntilSlotFrees();
+              }
+
+              // Record this request and forward
+              recordRequest();
+              totalForwarded++;
+
+              try {
+                const upRes = await forwardRequest(req.method, req.url, req.headers, body);
+
+                if (upRes.statusCode === 429) {
+                  total429Caught++;
+                  // Exponential backoff: 62s, 93s, ~140s, capped at 180s
+                  const backoff = Math.min(BASE_WAIT_MS * Math.pow(1.5, attempt), MAX_WAIT_MS);
+                  // Jitter: +/- 10%
+                  const jitter = backoff * (0.9 + Math.random() * 0.2);
+                  log(`[429 CAUGHT] Upstream returned 429 (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Waiting ${(jitter / 1000).toFixed(1)}s before retry...`);
+                  totalRetries++;
+                  await sleep(jitter);
+                  continue;
+                }
+
+                // Success (or non-429 error) — forward to client
+                res.writeHead(upRes.statusCode, upRes.headers);
+                res.end(upRes.body);
+                return;
+
+              } catch (err) {
+                lastErr = err;
+                log(`[ERROR] Upstream request failed: ${err.message} (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
+                if (attempt < MAX_RETRIES) {
+                  const backoff = Math.min(5000 * Math.pow(2, attempt), 60000);
+                  await sleep(backoff);
+                  continue;
+                }
+              }
+            }
+
+            // All retries exhausted
+            log(`[EXHAUSTED] All ${MAX_RETRIES + 1} attempts failed for ${req.method} ${req.url}`);
+            res.writeHead(502, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+              error: {
+                message: "Rate limit proxy: all retries exhausted. The upstream API may be temporarily unavailable. Please try again in a few minutes.",
+                type: "rate_limit_proxy_exhausted",
+                code: 502,
+              },
+            }));
+          }
+
+          // ── HTTP Server ───────────────────────────────
+          const server = http.createServer(async (req, res) => {
+            const body = await readBody(req);
+
+            // Non-completions endpoints: forward immediately without rate limiting
+            if (!req.url.includes("/chat/completions")) {
+              try {
+                const upRes = await forwardRequest(req.method, req.url, req.headers, body);
+                res.writeHead(upRes.statusCode, upRes.headers);
+                res.end(upRes.body);
+              } catch (err) {
+                log(`[ERROR] Passthrough failed: ${err.message}`);
+                res.writeHead(502, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { message: err.message } }));
+              }
+              return;
+            }
+
+            // Queue the completions request
+            const ok = enqueue(() => handleRequest(req, res, body));
+            if (!ok) {
+              log(`[QUEUE FULL] Rejecting request (queue=${MAX_QUEUE})`);
+              res.writeHead(503, { "content-type": "application/json" });
+              res.end(JSON.stringify({
+                error: {
+                  message: "Rate limit proxy: queue full. Too many concurrent requests.",
+                  type: "rate_limit_proxy_queue_full",
+                  code: 503,
+                },
+              }));
+            }
+          });
+
+          server.listen(LISTEN_PORT, "127.0.0.1", () => {
+            log(`Listening on 127.0.0.1:${LISTEN_PORT}`);
+            log(`Forwarding to ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
+            log(`Rate limit: ${RPM_LIMIT} req/min (sliding window)`);
+            log(`Max retries on 429: ${MAX_RETRIES}`);
+            log(`Base backoff on 429: ${BASE_WAIT_MS}ms`);
+          });
+
+          // ── Periodic stats ────────────────────────────
+          setInterval(() => {
+            pruneWindow();
+            log(`[STATS] forwarded=${totalForwarded} 429s_caught=${total429Caught} retries=${totalRetries} window=${timestamps.length}/${RPM_LIMIT} queue=${queue.length} queue_hwm=${queueHighWater}`);
+          }, 120_000);
+
+          // ── Graceful shutdown ─────────────────────────
+          process.on("SIGTERM", () => {
+            log("SIGTERM received, shutting down...");
+            server.close(() => process.exit(0));
+          });
+          process.on("SIGINT", () => {
+            log("SIGINT received, shutting down...");
+            server.close(() => process.exit(0));
+          });
+          PROXY_EOF
+
+          echo "Rate-limit proxy script created at /tmp/rate-limit-proxy.mjs"
+          echo "::endgroup::"
+
+      - name: Start rate-limit proxy
+        run: |
+          set -euo pipefail
+          echo "::group::Starting rate-limit proxy"
+
+          nohup node /tmp/rate-limit-proxy.mjs > /tmp/rate-limit-proxy.log 2>&1 &
+          RATE_PROXY_PID=$!
+          echo "Rate-limit proxy started (PID: $RATE_PROXY_PID)"
+          echo "RATE_PROXY_PID=$RATE_PROXY_PID" >> "$GITHUB_ENV"
+
+          # Wait for the proxy to be ready
+          echo "Waiting for rate-limit proxy to be ready..."
+          READY=false
+          for i in $(seq 1 30); do
+            if ! kill -0 $RATE_PROXY_PID 2>/dev/null; then
+              echo "::error::Rate-limit proxy died unexpectedly"
+              cat /tmp/rate-limit-proxy.log || true
+              exit 1
+            fi
+
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer dummykey" \
+              http://127.0.0.1:8318/v1/models 2>/dev/null || echo "000")
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Rate-limit proxy is ready! (HTTP $HTTP_CODE) — proxying 8318 -> 8317"
+              READY=true
+              break
+            fi
+
+            echo "  Attempt $i/30: HTTP $HTTP_CODE - waiting..."
+            sleep 1
+          done
+
+          if [ "$READY" = "false" ]; then
+            echo "::error::Rate-limit proxy didn't become ready within 30 seconds"
+            cat /tmp/rate-limit-proxy.log || true
+            exit 1
+          fi
+
+          # Show models through the proxy
+          echo ""
+          echo "Models available through rate-limit proxy:"
+          curl -s -H "Authorization: Bearer dummykey" \
+            http://127.0.0.1:8318/v1/models 2>/dev/null | jq '.data[].id' 2>/dev/null || echo "(could not list models)"
+
+          echo ""
+          echo "Rate-limit proxy logs:"
+          cat /tmp/rate-limit-proxy.log || true
+
+          echo "::endgroup::"
+
+      # ──────────────────────────────────────────────
       # 5. Run OpenClaw non-interactive onboarding
+      #    NOTE: Points to port 8318 (rate-limit proxy)
+      #    instead of 8317 (CLIProxyAPI direct)
       # ──────────────────────────────────────────────
 
       - name: Run OpenClaw onboarding (non-interactive)
@@ -283,11 +605,12 @@ jobs:
           echo "::group::Running OpenClaw onboarding"
 
           echo "Onboarding with model: $MODEL_ID"
+          echo "Using rate-limit proxy at http://127.0.0.1:8318/v1"
 
           openclaw onboard --non-interactive --accept-risk \
             --flow quickstart \
             --auth-choice custom-api-key \
-            --custom-base-url "http://127.0.0.1:8317/v1" \
+            --custom-base-url "http://127.0.0.1:8318/v1" \
             --custom-api-key "dummykey" \
             --custom-model-id "$MODEL_ID" \
             --custom-compatibility openai \
@@ -462,12 +785,25 @@ jobs:
           fi
 
           echo ""
+          echo "=== Rate-Limit Proxy Status ==="
+          if kill -0 $RATE_PROXY_PID 2>/dev/null; then
+            echo "Rate-limit proxy is running (PID: $RATE_PROXY_PID)"
+            echo "Proxying: 127.0.0.1:8318 -> 127.0.0.1:8317"
+          else
+            echo "::error::Rate-limit proxy is NOT running!"
+            cat /tmp/rate-limit-proxy.log || true
+            exit 1
+          fi
+
+          echo ""
           echo "=== Configuration Summary ==="
-          echo "LLM Provider: Custom (CLIProxyAPI -> $PROVIDER)"
+          echo "LLM Provider: Custom (Rate-Limit Proxy -> CLIProxyAPI -> $PROVIDER)"
           echo "Model: $MODEL_ID"
           echo "Context Window: $CONTEXT_WINDOW"
           echo "Max Tokens: $MAX_TOKENS"
-          echo "API Base: http://127.0.0.1:8317/v1"
+          echo "API Base: http://127.0.0.1:8318/v1 (rate-limited proxy)"
+          echo "Upstream: http://127.0.0.1:8317/v1 (CLIProxyAPI)"
+          echo "Rate Limit: 55 req/min (Qwen hard limit: 60/min)"
           echo "Channel: Discord (Open access)"
 
           echo "::endgroup::"
@@ -480,15 +816,25 @@ jobs:
           ### Configuration
           | Setting | Value |
           |---------|-------|
-          | LLM Provider | Custom (CLIProxyAPI -> $PROVIDER) |
+          | LLM Provider | Custom (Rate-Limit Proxy -> CLIProxyAPI -> $PROVIDER) |
           | Model | \`$MODEL_ID\` |
           | Context Window | $CONTEXT_WINDOW tokens |
           | Max Tokens | $MAX_TOKENS tokens |
-          | API Endpoint | \`http://127.0.0.1:8317/v1\` |
+          | API Endpoint | \`http://127.0.0.1:8318/v1\` (rate-limited) |
+          | Upstream | \`http://127.0.0.1:8317/v1\` (CLIProxyAPI) |
+          | Rate Limit | 55 req/min with auto-retry on 429 |
           | Routing | Round-robin across all $PROVIDER tokens |
           | Channel | Discord (Open access - all channels) |
           | Gateway | Local (port 18789, loopback, token auth) |
           | Timeout | 6 hours |
+
+          ### Rate Limit Protection
+          A Node.js rate-limit proxy sits between OpenClaw and CLIProxyAPI:
+          - **Sliding window**: Tracks requests per minute, throttles at 55/min (below Qwen's 60/min hard cap)
+          - **Auto-retry on 429**: If upstream returns 429, proxy waits 62s+ with exponential backoff and retries
+          - **Transparent to OpenClaw**: OpenClaw never sees rate limit errors — requests are simply delayed
+          - **Serial queue**: Ensures no request storms overwhelm the API
+          - **Up to 10 retries**: With escalating backoff up to 3 minutes between attempts
 
           ### Context Window Fix
           The workflow patches the model's \`contextWindow\` from the default 4096 to $CONTEXT_WINDOW tokens.
@@ -514,6 +860,7 @@ jobs:
           echo "  Starting OpenClaw Gateway + Discord Bot"
           echo "  Provider: $PROVIDER | Model: $MODEL_ID"
           echo "  Context Window: $CONTEXT_WINDOW tokens"
+          echo "  Rate Limit Proxy: 127.0.0.1:8318 -> 8317"
           echo "============================================"
           echo ""
 
@@ -524,6 +871,14 @@ jobs:
             exit 1
           fi
           echo "CLIProxyAPI is alive (PID: $PROXY_PID)"
+
+          # Verify rate-limit proxy is still running
+          if ! kill -0 $RATE_PROXY_PID 2>/dev/null; then
+            echo "::error::Rate-limit proxy died before gateway start!"
+            cat /tmp/rate-limit-proxy.log || true
+            exit 1
+          fi
+          echo "Rate-limit proxy is alive (PID: $RATE_PROXY_PID)"
 
           # Start the OpenClaw gateway directly (systemd doesn't work well in GitHub Actions)
           # The gateway connects to Discord, handles messages, and proxies to CLIProxyAPI
@@ -543,6 +898,8 @@ jobs:
             cat /tmp/openclaw-gateway.log || true
             echo "=== CLIProxyAPI logs ==="
             cat /tmp/cliproxyapi.log || true
+            echo "=== Rate-limit proxy logs ==="
+            cat /tmp/rate-limit-proxy.log || true
             exit 1
           fi
 
@@ -562,6 +919,7 @@ jobs:
           echo ""
           echo "============================================"
           echo "  OpenClaw is LIVE! Discord bot is online."
+          echo "  Rate limit proxy active (55 req/min cap)."
           echo "  The workflow will keep running for ~6 hours."
           echo "  Cancel this workflow to stop the bot."
           echo "============================================"
@@ -587,6 +945,21 @@ jobs:
               sleep 5
             fi
 
+            # Check if rate-limit proxy is alive
+            if ! kill -0 $RATE_PROXY_PID 2>/dev/null; then
+              echo ""
+              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [ERROR] Rate-limit proxy (PID: $RATE_PROXY_PID) died!"
+              echo "=== Rate-limit proxy logs ==="
+              tail -50 /tmp/rate-limit-proxy.log || true
+
+              # Try to restart rate-limit proxy
+              echo "Attempting to restart rate-limit proxy..."
+              nohup node /tmp/rate-limit-proxy.mjs > /tmp/rate-limit-proxy.log 2>&1 &
+              RATE_PROXY_PID=$!
+              echo "Rate-limit proxy restarted (PID: $RATE_PROXY_PID)"
+              sleep 3
+            fi
+
             # Check if gateway is alive
             if ! kill -0 $GATEWAY_PID 2>/dev/null; then
               echo ""
@@ -606,13 +979,15 @@ jobs:
             if [ $((ITERATION % 10)) -eq 0 ]; then
               UPTIME_MIN=$((ITERATION * 30 / 60))
               echo ""
-              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [STATUS] Uptime: ~${UPTIME_MIN}m | CLIProxyAPI PID: $PROXY_PID | Gateway PID: $GATEWAY_PID"
+              echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [STATUS] Uptime: ~${UPTIME_MIN}m | CLIProxyAPI PID: $PROXY_PID | Rate-Limit Proxy PID: $RATE_PROXY_PID | Gateway PID: $GATEWAY_PID"
 
               # Print last few lines of logs
               echo "--- Recent gateway logs ---"
               tail -5 /tmp/openclaw-gateway.log 2>/dev/null || true
               echo "--- Recent CLIProxyAPI logs ---"
               tail -5 /tmp/cliproxyapi.log 2>/dev/null || true
+              echo "--- Recent rate-limit proxy logs ---"
+              tail -5 /tmp/rate-limit-proxy.log 2>/dev/null || true
               echo "---"
             fi
 
