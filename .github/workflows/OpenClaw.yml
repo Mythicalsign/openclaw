@@ -125,11 +125,18 @@ jobs:
       # 3. Build & install CLIProxyAPI from source
       # ──────────────────────────────────────────────
 
-      - name: Install CLIProxyAPI from source
+      - name: Install CLIProxyAPI from source (forked, with rate-limit fixes)
         run: |
           set -euo pipefail
-          echo "::group::Building CLIProxyAPI"
-          git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git /tmp/CLIProxyAPI
+          echo "::group::Building CLIProxyAPI (forked repo with rate-limit fixes)"
+          # Clone the FORKED CLIProxyAPI which contains critical rate-limit fixes:
+          #   - waitForQwenRateLimit: transparently waits for a rate-limit slot
+          #     instead of returning 429, preventing credential kill cascades
+          #   - wrapQwenError: distinguishes per-minute rate limits (65s retry)
+          #     from daily quota exhaustion (cool until tomorrow)
+          #   - isQwenDailyQuotaError / isQwenRateLimitError: properly classify
+          #     "Free allocated quota exceeded" as per-minute, not daily
+          git clone --depth 1 https://github.com/89pl/CLIProxyAPI.git /tmp/CLIProxyAPI
           cd /tmp/CLIProxyAPI
           go build -o cli-proxy-api ./cmd/server
           sudo mv cli-proxy-api /usr/local/bin/cliproxyapi
@@ -211,10 +218,9 @@ jobs:
           routing:
             strategy: "round-robin"
           request-retry: 3
+          max-retry-interval: 120
+          disable-cooling: false
           EOF
-
-          # Fix indentation (remove leading whitespace from heredoc)
-          sed -i 's/^          //' "$AUTH_DIR/config.yaml"
 
           echo "CLIProxyAPI config created"
           cat "$AUTH_DIR/config.yaml"
@@ -245,7 +251,7 @@ jobs:
             # Try health check with auth header
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer dummykey" \
-              http://127.0.0.1:8317/v1/models 2>/dev/null || echo "000")
+              http://127.0.0.1:8317/v1/models 2>/dev/null | head -c3 || echo "000")
 
             if [ "$HTTP_CODE" = "200" ]; then
               echo "CLIProxyAPI is ready! (HTTP $HTTP_CODE)"
@@ -274,7 +280,23 @@ jobs:
           echo "::endgroup::"
 
       # ──────────────────────────────────────────────
+      # NOTE: The Node.js rate-limit proxy (port 8318) has been REMOVED.
+      #
+      # Rate limiting is now handled INSIDE CLIProxyAPI itself:
+      #   - waitForQwenRateLimit: transparently waits for a rate-limit slot
+      #     instead of returning 429, preventing credential kill cascades
+      #   - wrapQwenError: distinguishes per-minute rate limits (65s retry)
+      #     from daily quota exhaustion (cool until tomorrow)
+      #   - isQwenRateLimitError: properly classifies "Free allocated quota
+      #     exceeded" as per-minute, not daily quota exhaustion
+      #
+      # OpenClaw now connects directly to CLIProxyAPI on port 8317.
+      # ──────────────────────────────────────────────
+
+      # ──────────────────────────────────────────────
       # 5. Run OpenClaw non-interactive onboarding
+      #    Points directly to CLIProxyAPI on port 8317
+      #    (rate limiting is handled inside CLIProxyAPI)
       # ──────────────────────────────────────────────
 
       - name: Run OpenClaw onboarding (non-interactive)
@@ -283,6 +305,7 @@ jobs:
           echo "::group::Running OpenClaw onboarding"
 
           echo "Onboarding with model: $MODEL_ID"
+          echo "Using CLIProxyAPI at http://127.0.0.1:8317/v1 (rate limiting built-in)"
 
           openclaw onboard --non-interactive --accept-risk \
             --flow quickstart \
@@ -412,9 +435,21 @@ jobs:
 
           mkdir -p "$HOME/.openclaw/workspace"
 
-          # Install clawhub - the main skill dependency
-          openclaw skills install clawhub || {
-            echo "::warning::clawhub skill install failed - continuing without it"
+          CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+
+          # Register the clawhub skill in the config.
+          # The OpenClaw config schema for skills.entries is strict — only
+          # these keys are allowed: enabled, apiKey, env, config.
+          # Any other key (e.g. "source") causes a validation error and
+          # crashes the gateway with "Unrecognized key".
+          # clawhub is a bundled/workspace skill that OpenClaw discovers
+          # automatically once enabled here.
+          jq '
+            .skills.entries["@openclaw/clawhub"] = {
+              "enabled": true
+            }
+          ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" 2>/dev/null && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE" && echo "clawhub skill enabled in config" || {
+            echo "::warning::Could not add clawhub skill - continuing without it"
           }
 
           echo "::endgroup::"
@@ -447,6 +482,38 @@ jobs:
             else . end
           ' "$CONFIG_FILE"
 
+          # Validate that skill entries don't contain unrecognized keys.
+          # The OpenClaw schema only allows: enabled, apiKey, env, config.
+          # Any other key will cause the gateway to crash.
+          echo ""
+          echo "=== Config Schema Pre-Check ==="
+          INVALID_KEYS=$(jq -r '
+            .skills.entries // {} | to_entries[] |
+            .key as $skill |
+            .value | keys[] |
+            select(. != "enabled" and . != "apiKey" and . != "env" and . != "config") |
+            "\($skill): unrecognized key \"\(.)\""
+          ' "$CONFIG_FILE" 2>/dev/null || true)
+
+          if [ -n "$INVALID_KEYS" ]; then
+            echo "::error::Config has invalid skill entry keys that will crash the gateway!"
+            echo "$INVALID_KEYS"
+            echo ""
+            echo "Attempting auto-fix: stripping unrecognized keys..."
+            jq '
+              .skills.entries //= {} |
+              .skills.entries |= with_entries(
+                .value |= with_entries(
+                  select(.key == "enabled" or .key == "apiKey" or .key == "env" or .key == "config")
+                )
+              )
+            ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            echo "Auto-fix applied. Cleaned config skill entries:"
+            jq '.skills.entries' "$CONFIG_FILE"
+          else
+            echo "Skill entries schema OK (no unrecognized keys)"
+          fi
+
           echo ""
           echo "=== CLIProxyAPI Status ==="
           if kill -0 $PROXY_PID 2>/dev/null; then
@@ -462,12 +529,14 @@ jobs:
           fi
 
           echo ""
+          echo ""
           echo "=== Configuration Summary ==="
           echo "LLM Provider: Custom (CLIProxyAPI -> $PROVIDER)"
           echo "Model: $MODEL_ID"
           echo "Context Window: $CONTEXT_WINDOW"
           echo "Max Tokens: $MAX_TOKENS"
-          echo "API Base: http://127.0.0.1:8317/v1"
+          echo "API Endpoint: http://127.0.0.1:8317/v1 (CLIProxyAPI, rate limiting built-in)"
+          echo "Rate Limit: 60 req/min (handled internally by CLIProxyAPI with transparent wait)"
           echo "Channel: Discord (Open access)"
 
           echo "::endgroup::"
@@ -484,11 +553,21 @@ jobs:
           | Model | \`$MODEL_ID\` |
           | Context Window | $CONTEXT_WINDOW tokens |
           | Max Tokens | $MAX_TOKENS tokens |
-          | API Endpoint | \`http://127.0.0.1:8317/v1\` |
+          | API Endpoint | \`http://127.0.0.1:8317/v1\` (CLIProxyAPI, rate limiting built-in) |
+          | Rate Limit | 60 req/min (transparent wait inside CLIProxyAPI) |
           | Routing | Round-robin across all $PROVIDER tokens |
           | Channel | Discord (Open access - all channels) |
           | Gateway | Local (port 18789, loopback, token auth) |
           | Timeout | 6 hours |
+
+          ### Rate Limit Protection (Built Into CLIProxyAPI)
+          Rate limiting is handled **inside CLIProxyAPI itself** (no external proxy needed):
+          - **waitForQwenRateLimit**: Transparently waits for a rate-limit slot (up to 120s) instead of returning 429
+          - **Per-minute vs daily**: Distinguishes per-minute rate limits (65s retry) from daily quota exhaustion (cool until tomorrow)
+          - **No credential killing**: Per-minute 429s reset backoff level to 0, preventing exponential backoff deadlock
+          - **Retry with cooldown**: request-retry=3 + max-retry-interval=120s allows conductor to wait out short cooldowns
+          - **Transparent to OpenClaw**: OpenClaw never sees rate limit errors — requests are simply delayed
+          - **Concurrent-safe**: Thread-safe sliding window per credential
 
           ### Context Window Fix
           The workflow patches the model's \`contextWindow\` from the default 4096 to $CONTEXT_WINDOW tokens.
@@ -499,6 +578,31 @@ jobs:
           The bot should be online and responding to messages.
           The workflow will keep running for up to 6 hours or until manually cancelled.
           EOF
+
+      # ──────────────────────────────────────────────
+      # 7.5. Run doctor --fix to clean up any config issues
+      # ──────────────────────────────────────────────
+
+      - name: Run OpenClaw doctor --fix
+        run: |
+          set -euo pipefail
+          echo "::group::Running openclaw doctor --fix"
+
+          # doctor --fix removes unrecognized keys and applies
+          # recommended changes (e.g. enabling Discord when token
+          # is present). This is a safety net in case any config
+          # patching introduced unknown fields.
+          if openclaw doctor --fix 2>&1; then
+            echo "Doctor completed successfully"
+          else
+            echo "::warning::Doctor exited with non-zero status — continuing anyway"
+          fi
+
+          echo ""
+          echo "Config after doctor --fix:"
+          jq '.' "$HOME/.openclaw/openclaw.json" 2>/dev/null | head -80 || true
+
+          echo "::endgroup::"
 
       # ──────────────────────────────────────────────
       # 8. Start OpenClaw gateway and keep alive
@@ -514,6 +618,7 @@ jobs:
           echo "  Starting OpenClaw Gateway + Discord Bot"
           echo "  Provider: $PROVIDER | Model: $MODEL_ID"
           echo "  Context Window: $CONTEXT_WINDOW tokens"
+          echo "  CLIProxyAPI: 127.0.0.1:8317 (rate limiting built-in)"
           echo "============================================"
           echo ""
 
@@ -562,6 +667,7 @@ jobs:
           echo ""
           echo "============================================"
           echo "  OpenClaw is LIVE! Discord bot is online."
+          echo "  Rate limiting handled by CLIProxyAPI (60 req/min, transparent wait)."
           echo "  The workflow will keep running for ~6 hours."
           echo "  Cancel this workflow to stop the bot."
           echo "============================================"
@@ -581,7 +687,7 @@ jobs:
 
               # Try to restart CLIProxyAPI
               echo "Attempting to restart CLIProxyAPI..."
-              nohup cliproxyapi -config "$AUTH_DIR/config.yaml" > /tmp/cliproxyapi.log 2>&1 &
+              nohup cliproxyapi -config "$AUTH_DIR/config.yaml" >> /tmp/cliproxyapi.log 2>&1 &
               PROXY_PID=$!
               echo "CLIProxyAPI restarted (PID: $PROXY_PID)"
               sleep 5
@@ -596,7 +702,7 @@ jobs:
 
               # Try to restart gateway
               echo "Attempting to restart gateway..."
-              nohup openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &
+              nohup openclaw gateway >> /tmp/openclaw-gateway.log 2>&1 &
               GATEWAY_PID=$!
               echo "Gateway restarted (PID: $GATEWAY_PID)"
               sleep 10
