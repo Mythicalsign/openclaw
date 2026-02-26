@@ -217,7 +217,9 @@ jobs:
             - "dummykey"
           routing:
             strategy: "round-robin"
-          request-retry: 1
+          request-retry: 3
+          max-retry-interval: 120
+          disable-cooling: false
           EOF
 
           echo "CLIProxyAPI config created"
@@ -560,9 +562,10 @@ jobs:
 
           ### Rate Limit Protection (Built Into CLIProxyAPI)
           Rate limiting is handled **inside CLIProxyAPI itself** (no external proxy needed):
-          - **waitForQwenRateLimit**: Transparently waits for a rate-limit slot (up to 90s) instead of returning 429
+          - **waitForQwenRateLimit**: Transparently waits for a rate-limit slot (up to 120s) instead of returning 429
           - **Per-minute vs daily**: Distinguishes per-minute rate limits (65s retry) from daily quota exhaustion (cool until tomorrow)
-          - **No credential killing**: "Free allocated quota exceeded" (per-minute) no longer marks credentials as permanently dead
+          - **No credential killing**: Per-minute 429s reset backoff level to 0, preventing exponential backoff deadlock
+          - **Retry with cooldown**: request-retry=3 + max-retry-interval=120s allows conductor to wait out short cooldowns
           - **Transparent to OpenClaw**: OpenClaw never sees rate limit errors — requests are simply delayed
           - **Concurrent-safe**: Thread-safe sliding window per credential
 
